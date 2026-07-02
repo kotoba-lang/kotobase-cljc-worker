@@ -1,0 +1,29 @@
+;; CLJC kotobase datom-plane worker.
+;;  :test   — node-test of the pure handler (in-memory store)
+;;  :worker — :esm workerd bundle (default export = fetch/scheduled handler)
+;;
+;; The engine dep chain is consumed as shadow-cljs source-paths from the west
+;; checkout (same pattern app-aozora uses for kotobase-client/atproto/mst),
+;; relative to orgs/kotoba-lang/kotobase-cljc-worker → orgs/kotoba-lang/<dep>.
+{:source-paths
+ ["src" "test"
+  "../kotobase-engine/src"
+  "../kqe/src"
+  "../quad-store/src"
+  "../prolly-tree/src"
+  "../commit-dag/src"
+  "../ipld/src"
+  "../multiformats/src"
+  "../dag-cbor/src"
+  ;; byte-exact CACAO verify + canonical-graph
+  "../kotobase-client/src"]
+
+ :dependencies []
+
+ :builds
+ {:test   {:target :node-test
+           :output-to "out/node-tests.js"
+           :ns-regexp "-test$"}
+  :worker {:target :esm
+           :output-dir "out"
+           :modules {:worker {:exports {default kotobase.cljc-worker.worker/handler}}}}}}

@@ -1,0 +1,26 @@
+{
+  // CLJC kotobase datom-plane worker — filter-honoring replacement for the WASM
+  // worker (ADR-2607022330 addendum 2). Build: `npx shadow-cljs release worker`
+  // → out/worker.js (:esm, default export {fetch}).
+  //
+  // NOTE: routes intentionally omit the kotobase.aozora.app custom domain — that
+  // cutover is gated on the data migration (#15). Deploy to workers.dev first,
+  // smoke-test against a NEW R2 prefix, migrate yoro-social, THEN move the route.
+  "name": "kotobase-cljc-worker",
+  "main": "out/worker.js",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "r2_buckets": [
+    { "binding": "BUCKET", "bucket_name": "kotobase-wasm-staging" }
+  ],
+  "vars": {
+    // NEW prefix — the CLJC prolly/commit-dag block format is incompatible with
+    // the Rust WASM format under kotobase/wasm-staging, so it lives separately
+    // and the old data stays intact for rollback.
+    "KOTOBASE_B2_PREFIX": "kotobase/cljc",
+    // empty = accept any validly-signed CACAO (staging); set the operator DID
+    // allowlist before the production cutover.
+    "KOTOBASE_OPERATOR_DIDS": ""
+  }
+}
