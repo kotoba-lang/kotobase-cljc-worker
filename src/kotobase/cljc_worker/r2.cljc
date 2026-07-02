@@ -10,9 +10,17 @@
   (:require [clojure.string :as str]))
 
 (defn missing-block
-  "Signal thrown by the sync get-fn on a cache miss; caught by with-blocks."
+  "Signal thrown by the sync get-fn on a cache miss; caught by with-blocks. The
+  `:block-miss` marker lets handler/handle re-throw it (rather than swallow it as
+  an InternalError) so the trampoline actually sees the miss."
   [cid]
-  (ex-info "block-miss" {::miss cid}))
+  (ex-info "block-miss" {:block-miss true :cid cid}))
+
+(defn block-miss?
+  "True if `e` is the trampoline's cache-miss signal (used by handler/handle to
+  re-throw instead of catching)."
+  [e]
+  (boolean (:block-miss (ex-data e))))
 
 (defn with-blocks
   "Run `(f sync-get)` where `sync-get` reads from an in-memory cache, fetching
@@ -27,8 +35,8 @@
     (letfn [(step []
               (let [outcome (try {:done (f sync-get)}
                                  (catch :default e
-                                   (if-let [cid (::miss (ex-data e))]
-                                     {:miss cid}
+                                   (if (:block-miss (ex-data e))
+                                     {:miss (:cid (ex-data e))}
                                      {:error e})))]
                 (cond
                   (contains? outcome :done)  (js/Promise.resolve (:done outcome))

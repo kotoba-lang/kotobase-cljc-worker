@@ -26,4 +26,8 @@
            :ns-regexp "-test$"}
   :worker {:target :esm
            :output-dir "out"
-           :modules {:worker {:exports {default kotobase.cljc-worker.worker/handler}}}}}}
+           :modules {:worker {:exports {default kotobase.cljc-worker.worker/handler}}}}
+  ;; dev/migration tool — mint a transact CACAO (node)
+  :mint   {:target :node-script
+           :output-to "out/mint.js"
+           :main kotobase.cljc-worker.mint/-main}}}

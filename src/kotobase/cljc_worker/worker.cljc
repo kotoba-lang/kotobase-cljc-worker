@@ -40,12 +40,18 @@
         iss))
     (catch :default _ nil)))
 
-(defn- allowlisted? [^js env issuer graph]
-  (let [csv (some-> (.-KOTOBASE_OPERATOR_DIDS env) str/trim)]
-    (or (str/blank? (or csv ""))                      ; empty allowlist = accept any valid CACAO
-        (and issuer (str/includes? (str "," csv ",") (str "," issuer ","))
-             ;; issuer must own the graph it writes: kotobase/db/<did>/<db>
-             (str/includes? (str graph) issuer)))))
+(defn- authorized?
+  "A transact is authorized iff a CACAO VERIFIED (issuer non-nil) and — when a
+  non-empty operator allowlist is configured — the issuer is on it. An empty
+  allowlist means 'any valid issuer', NOT 'no auth': a missing/invalid CACAO
+  (issuer nil) is always rejected. GRAPH OWNERSHIP is structural, not checked
+  here: the write graph is DERIVED as `canonical-graph(issuer, db_name)`, so an
+  issuer can only ever write its own graph."
+  [^js env issuer]
+  (and issuer
+       (let [csv (some-> (.-KOTOBASE_OPERATOR_DIDS env) str/trim)]
+         (or (str/blank? (or csv ""))
+             (str/includes? (str "," csv ",") (str "," issuer ","))))))
 
 ;; ── HTTP ─────────────────────────────────────────────────────────────────────
 
@@ -126,10 +132,15 @@
                        (case method
                          ("datoms" "q" "pull") (run-read (.-BUCKET env) (prefix env) method body)
                          "transact"
+                         ;; kotobase transact sends :db_name (+ cacao), NOT :graph —
+                         ;; the graph is DERIVED as canonical-graph(issuer, db_name)
+                         ;; so a write always lands on the issuer's own graph.
                          (let [issuer (some-> (:cacao_b64 body) verify-cacao)]
-                           (if-not (allowlisted? env issuer (:graph body))
+                           (if-not (authorized? env issuer)
                              (js/Promise.resolve (json-response {:ok false :error "AuthRequired"} 403))
-                             (run-transact (.-BUCKET env) (prefix env) body issuer)))
+                             (let [graph (cid/canonical-graph issuer (:db_name body))]
+                               (run-transact (.-BUCKET env) (prefix env)
+                                             (assoc body :graph graph) issuer))))
                          (js/Promise.resolve {:ok false :error "MethodNotImplemented" :method method})))))
             (.then (fn [resp] (if (instance? js/Response resp) resp (json-response resp 200))))
             (.catch (fn [^js e]

@@ -113,5 +113,9 @@
       "pull"     (do-pull store body)
       {:ok false :error "MethodNotImplemented" :method method})
     (catch #?(:clj Exception :cljs :default) e
-      {:ok false :error "InternalError"
-       :message #?(:clj (.getMessage e) :cljs (.-message e))})))
+      ;; the R2 trampoline's cache-miss must propagate to with-blocks, NOT be
+      ;; swallowed here — re-throw it; only real errors become InternalError.
+      (if (:block-miss (ex-data e))
+        (throw e)
+        {:ok false :error "InternalError"
+         :message #?(:clj (.getMessage e) :cljs (.-message e))}))))
