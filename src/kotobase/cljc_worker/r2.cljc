@@ -65,3 +65,41 @@
 (defn r2-get-text
   [^js bucket k]
   (-> (.get bucket k) (.then (fn [obj] (when obj (.text obj))))))
+
+;; ── head pointer: optimistic-concurrency (CAS) read/write ───────────────────
+;;
+;; A plain (unconditional) head .put races: two overlapping transacts against
+;; the SAME graph (the PDS's operator-identity yoro-social graph is shared
+;; across every actor's createRecord, so this is the common case, not an edge
+;; case — confirmed live 2026-07-03, ADR-2607022330 addendum 3) both read the
+;; same prev head, both compute a commit chained off it, and whichever `.put`
+;; lands LAST wins — the other's commit becomes an orphan, unreachable from
+;; the head chain even though its blocks are still in R2 (nothing is
+;; corrupted, just invisible). r2-get-head/r2-put-head-if-match close that
+;; race with R2's native conditional-write support (the `onlyIf` option),
+;; mirroring HTTP's ETag/If-Match — no Durable Object, no new component.
+
+(defn r2-get-head
+  "→ Promise<{:chain string|nil :etag string|nil}> for the graph's head
+  pointer. :etag nil when the key doesn't exist yet (first write to a new
+  graph) — callers use that to choose the create-if-absent put path."
+  [^js bucket k]
+  (-> (.get bucket k)
+      (.then (fn [^js obj]
+               (if (nil? obj)
+                 {:chain nil :etag nil}
+                 (-> (.text obj) (.then (fn [text] {:chain text :etag (.-etag obj)}))))))))
+
+(defn r2-put-head-if-match
+  "Conditional head write: succeeds only if the key's CURRENT etag still
+  equals `etag` (R2's onlyIf.etagMatches — a native compare-and-swap, no
+  read-modify-write gap). `etag` nil means \"only if the key does NOT yet
+  exist\" (etagMatches \"\" — R2 has no wildcard absence match, so the empty
+  string is used as a value no real object etag can ever equal, giving the
+  same create-if-absent effect for the narrow first-write-to-a-new-graph
+  race). → Promise<boolean> (true = written, false = lost the race — caller
+  must re-read the now-current head and retry)."
+  [^js bucket k chain etag]
+  (-> (.put bucket k chain
+           #js {:onlyIf #js {:etagMatches (or etag "")}})
+      (.then (fn [result] (boolean result)))))
