@@ -15,7 +15,7 @@
                            [["keybackup/zA" ":aozora.keyBackup/did" "did:key:zA"]
                             ["keybackup/zA" ":aozora.keyBackup/blob" "blobA"]
                             ["keybackup/zB" ":aozora.keyBackup/did" "did:key:zB"]])
-          chain (eng/commit! put! sync-get db nil)
+          chain (eng/snapshot! put! sync-get db nil)
           snap  (eng/latest-snapshot-cid sync-get chain)
           ;; async R2 fetch: resolve the block on a microtask
           fetch1 (fn [cid] (js/Promise.resolve (get @blocks cid)))

@@ -109,25 +109,29 @@
   8)
 
 (defn- flush-blocks-and-cas-head!
-  "After a successful pure transact: flush the buffered blocks (always safe
-  to write even on an eventual CAS loss — content-addressed, so a retry's
-  blocks are either identical or simply orphaned, never corrupting), then
-  attempt the conditional head write. → Promise<{:resp map :cas-ok? bool}>."
+  "After a successful pure write (transact OR fold): flush the buffered
+  blocks (always safe to write even on an eventual CAS loss — content-
+  addressed, so a retry's blocks are either identical or simply orphaned,
+  never corrupting), then attempt the conditional head write. A response
+  with no `:commit` (a real error, or a fold that found nothing to fold)
+  skips the CAS entirely — nothing to write, nothing to retry.
+  → Promise<{:resp map :cas-ok? bool}>."
   [^js bucket pfx graph etag resp buffer]
-  (if-not (:ok resp)
-    (js/Promise.resolve {:resp resp :cas-ok? true})   ; real error, not a race — don't retry
+  (if (nil? (:commit resp))
+    (js/Promise.resolve {:resp resp :cas-ok? true})
     (-> (js/Promise.all
          (clj->js (map (fn [[cid bytes]] (r2/r2-put-bytes bucket (r2/block-key pfx cid) bytes))
                        @buffer)))
         (.then (fn [_] (r2/r2-put-head-if-match bucket (r2/head-key pfx graph) (:commit resp) etag)))
         (.then (fn [cas-ok?] {:resp resp :cas-ok? cas-ok?})))))
 
-(defn- run-transact-attempt
-  "One CAS round: read the head + its etag, run the pure handler against
-  that snapshot, then flush-blocks-and-cas-head!. → Promise<{:resp map
-  :cas-ok? bool}>; :cas-ok? false means another writer's head update landed
-  first — the caller retries from a fresh head read."
-  [^js bucket pfx body auth-did]
+(defn- run-write-attempt
+  "One CAS round for a head-mutating method (transact or fold): read the
+  head + its etag, run the pure handler against that snapshot, then
+  flush-blocks-and-cas-head!. → Promise<{:resp map :cas-ok? bool}>;
+  :cas-ok? false means another writer's head update landed first — the
+  caller retries from a fresh head read."
+  [^js bucket pfx method body auth-did]
   (let [buffer (atom {})
         graph  (:graph body)]
     (-> (r2/r2-get-head bucket (r2/head-key pfx graph))
@@ -139,23 +143,24 @@
                                    :put! (fn [cid bytes] (swap! buffer assoc cid bytes))
                                    :head-get (constantly chain)
                                    :head-put! (fn [_ _] nil)}   ; head CAS'd below
-                                  "transact" body auth-did)))
+                                  method body auth-did)))
                      (.then (fn [resp] (flush-blocks-and-cas-head! bucket pfx graph etag resp buffer)))))))))
 
-(defn- run-transact
-  "transact: CAS-guarded head advance (see run-transact-attempt) with retry
-  on lost races — never silently drops a commit whose blocks made it to R2;
-  either the head lands or the caller gets ConcurrentWriteConflict after
-  exhausting retries (loud failure beats silent data loss). Closes a real,
-  confirmed-live race: every actor's createRecord lands on the SAME shared
-  operator-identity graph, so overlapping transacts (worker slowness widens
-  the window; the PDS's own relay-ingest cron writes the same graph too)
-  raced the OLD unconditional head .put — whichever landed last silently
-  orphaned the other's commit (blocks stayed in R2, never corrupted, just
-  unreachable from the head chain). See ADR-2607022330 addendum 3."
-  ([bucket pfx body auth-did] (run-transact bucket pfx body auth-did 1))
-  ([^js bucket pfx body auth-did attempt]
-   (-> (run-transact-attempt bucket pfx body auth-did)
+(defn- run-write
+  "transact/fold: CAS-guarded head advance (see run-write-attempt) with
+  retry on lost races — never silently drops a commit whose blocks made it
+  to R2; either the head lands or the caller gets ConcurrentWriteConflict
+  after exhausting retries (loud failure beats silent data loss). Closes a
+  real, confirmed-live race: every actor's createRecord lands on the SAME
+  shared operator-identity graph, so overlapping writers (worker slowness
+  widens the window; the PDS's own relay-ingest cron writes the same graph
+  too) raced the OLD unconditional head .put — whichever landed last
+  silently orphaned the other's commit (blocks stayed in R2, never
+  corrupted, just unreachable from the head chain). See ADR-2607022330
+  addendum 3."
+  ([bucket pfx method body auth-did] (run-write bucket pfx method body auth-did 1))
+  ([^js bucket pfx method body auth-did attempt]
+   (-> (run-write-attempt bucket pfx method body auth-did)
        (.then (fn [{:keys [resp cas-ok?]}]
                 (cond
                   cas-ok? resp
@@ -164,7 +169,7 @@
                    :message (str "head CAS lost the race " attempt " times")}
                   :else
                   (-> (delay-ms (min 800 (* 50 attempt)))
-                      (.then (fn [_] (run-transact bucket pfx body auth-did (inc attempt)))))))))))
+                      (.then (fn [_] (run-write bucket pfx method body auth-did (inc attempt)))))))))))
 
 ;; ── dispatch ─────────────────────────────────────────────────────────────────
 
@@ -193,8 +198,17 @@
                            (if-not (authorized? env issuer)
                              (js/Promise.resolve (json-response {:ok false :error "AuthRequired"} 403))
                              (let [graph (cid/canonical-graph issuer (:db_name body))]
-                               (run-transact (.-BUCKET env) (prefix env)
-                                             (assoc body :graph graph) issuer))))
+                               (run-write (.-BUCKET env) (prefix env) "transact"
+                                          (assoc body :graph graph) issuer))))
+                         "fold"
+                         ;; Maintenance op (ADR-2607032430 D1): an authorized caller
+                         ;; (cron/ops, not necessarily the graph owner — one operator
+                         ;; identity may fold many actors' graphs) names the :graph
+                         ;; directly, unlike transact's derived graph.
+                         (let [issuer (some-> (:cacao_b64 body) verify-cacao)]
+                           (if-not (authorized? env issuer)
+                             (js/Promise.resolve (json-response {:ok false :error "AuthRequired"} 403))
+                             (run-write (.-BUCKET env) (prefix env) "fold" body issuer)))
                          (js/Promise.resolve {:ok false :error "MethodNotImplemented" :method method})))))
             (.then (fn [resp] (if (instance? js/Response resp) resp (json-response resp 200))))
             (.catch (fn [^js e]
