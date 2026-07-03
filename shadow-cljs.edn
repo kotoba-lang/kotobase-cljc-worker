@@ -8,6 +8,7 @@
 {:source-paths
  ["src" "test"
   "../kotobase-engine/src"
+  "../datom/src"          ; canonical datom model (datom.core), consumed by the engine
   "../kqe/src"
   "../quad-store/src"
   "../prolly-tree/src"

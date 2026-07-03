@@ -23,18 +23,16 @@
 
 (defn tx-edn->quads
   "Parse a kotobase `tx_edn` string — a vector of entity maps
-  `[{:db/id \"e\" :ns/attr v …} …]` — into `{:s :p :o}` quads (one per non-:db/id
-  pair). Reads the whole string as EDN (no brace-splitting), so map/vector values
-  containing literal braces are safe (the old tx-edn.mjs brace-split bug)."
+  `[{:db/id \"e\" :ns/attr v …} …]` — into `{:s :p :o}` quads. Datafication goes
+  through the engine's canonical datom model (`eng/entities->datoms` =
+  `datom.core/eavt`), the SAME `[e a v]` representation kgraph (the language's
+  in-mem view) speaks — ONE shared datom model across transport, DB, and language
+  (ADR-2607032500). Reads the whole string as EDN (no brace-splitting) so map/
+  vector values with literal braces are safe (the old tx-edn.mjs brace-split bug).
+  `(str :ns/attr)` keeps the leading ':' — PDS datom consumers key on \":ns/attr\"."
   [tx-edn]
-  (let [forms (edn/read-string tx-edn)]
-    (for [ent forms
-          :let [s (:db/id ent)]
-          [k v] ent
-          :when (not= k :db/id)]
-      ;; (str :ns/attr) already includes the leading ':' — the PDS's datom
-      ;; consumers key on ":ns/attr" (with the colon), so keep it verbatim.
-      {:s (str s) :p (str k) :o (str v)})))
+  (map (fn [[e a v]] {:s (str e) :p (str a) :o (str v)})
+       (eng/entities->datoms (edn/read-string tx-edn))))
 
 ;; ── read/write against the graph's persisted chain (ADR-2607032430 D1) ──────
 ;; The chain's head IS the unit of state now (snapshot + pending novelty), not
