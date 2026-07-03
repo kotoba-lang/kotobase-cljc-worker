@@ -22,7 +22,9 @@
     // NEW prefix — the CLJC prolly/commit-dag block format is incompatible with
     // the Rust WASM format under kotobase/wasm-staging, so it lives separately
     // and the old data stays intact for rollback.
-    "KOTOBASE_B2_PREFIX": "kotobase/cljc",
+    // v2 = a fresh namespace after the relay-cron bloat was cleared (the cron
+    // firehose-ingested ~3k datoms into the shared yoro-social; disabled + reset).
+    "KOTOBASE_B2_PREFIX": "kotobase/cljc-v2",
     // empty = accept any validly-signed CACAO (staging); set the operator DID
     // allowlist before the production cutover.
     "KOTOBASE_OPERATOR_DIDS": ""

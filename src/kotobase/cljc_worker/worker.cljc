@@ -10,6 +10,7 @@
   Env bindings: BUCKET (R2), KOTOBASE_B2_PREFIX (var, block/head key prefix),
   KOTOBASE_OPERATOR_DIDS (var, optional CSV allowlist of transact issuers)."
   (:require [clojure.string :as str]
+            [goog.object :as gobj]
             [kotobase.cljc-worker.handler :as h]
             [kotobase.cljc-worker.r2 :as r2]
             [kotobase.cacao :as cacao]
@@ -49,7 +50,12 @@
   issuer can only ever write its own graph."
   [^js env issuer]
   (and issuer
-       (let [csv (some-> (.-KOTOBASE_OPERATOR_DIDS env) str/trim)]
+       ;; gobj/get, NOT (.-KOTOBASE_OPERATOR_DIDS env): the direct property access
+       ;; is renamed under :advanced and reads undefined (the same Closure-rename
+       ;; that collapsed the block prefix). That is invisible while the allowlist
+       ;; is empty ("any valid issuer"), but would SILENTLY IGNORE a configured
+       ;; production allowlist — i.e. accept any signer — so it must be extern-safe.
+       (let [csv (some-> (gobj/get env "KOTOBASE_OPERATOR_DIDS") str/trim)]
          (or (str/blank? (or csv ""))
              (str/includes? (str "," csv ",") (str "," issuer ","))))))
 
@@ -68,7 +74,15 @@
                                        "access-control-allow-headers" "authorization, content-type"
                                        "access-control-max-age" "86400"}}))
 
-(defn- prefix [env] (or (some-> (.-KOTOBASE_B2_PREFIX env) (str "/")) ""))
+(defn- prefix
+  "Block/head key prefix from KOTOBASE_B2_PREFIX. Read via goog.object/get, NOT
+  `(.-KOTOBASE_B2_PREFIX env)`: under :advanced the direct property access is
+  renamed and silently reads undefined (same Closure-rename class as the PRF
+  extension bug), which collapsed the prefix to \"\" and scattered blocks at the
+  bucket root regardless of the configured var."
+  [env]
+  (let [v (gobj/get env "KOTOBASE_B2_PREFIX")]
+    (if (seq v) (str v "/") "")))
 
 ;; ── read / write orchestration over R2 ───────────────────────────────────────
 

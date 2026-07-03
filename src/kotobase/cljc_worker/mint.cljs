@@ -13,7 +13,14 @@
     (dotimes [i n] (aset out i (js/parseInt (subs s (* 2 i) (+ 2 (* 2 i))) 16)))
     out))
 
-(defn -main [& [seed-hex db-name aud]]
+(defn -main [& args]
+  (if (= "graph" (first args))
+    ;; `node out/mint.js graph <did> <db-name>` → print the canonical graph CID
+    (let [[_ did db] args]
+      (println (cid/canonical-graph did (or db "yoro-social"))))
+    (apply -mint args)))
+
+(defn -mint [& [seed-hex db-name aud]]
   (let [seed (hex->bytes (or seed-hex (apply str (repeat 64 "0"))))
         db   (or db-name "yoro-social")
         aud  (or aud "did:web:kotobase.aozora.app")
