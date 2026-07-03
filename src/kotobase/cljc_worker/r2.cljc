@@ -91,15 +91,26 @@
                  (-> (.text obj) (.then (fn [text] {:chain text :etag (.-etag obj)}))))))))
 
 (defn r2-put-head-if-match
-  "Conditional head write: succeeds only if the key's CURRENT etag still
-  equals `etag` (R2's onlyIf.etagMatches — a native compare-and-swap, no
-  read-modify-write gap). `etag` nil means \"only if the key does NOT yet
-  exist\" (etagMatches \"\" — R2 has no wildcard absence match, so the empty
-  string is used as a value no real object etag can ever equal, giving the
-  same create-if-absent effect for the narrow first-write-to-a-new-graph
-  race). → Promise<boolean> (true = written, false = lost the race — caller
-  must re-read the now-current head and retry)."
+  "Conditional head write. `etag` non-nil: succeeds only if the key's CURRENT
+  etag still equals `etag` (R2's onlyIf.etagMatches — a native
+  compare-and-swap against a KNOWN-EXISTING object, no read-modify-write
+  gap). `etag` nil: the caller's r2-get-head found no object, i.e. first
+  write to a new graph — R2's onlyIf has no documented \"only if absent\"
+  condition (etagMatches against a nonexistent object is a comparison with
+  nothing, not a green light; an earlier version of this fn wrongly assumed
+  etagMatches \"\" would treat absence as a match, which live-tested as an
+  ALWAYS-FAILING condition — every first write to a brand-new graph lost the
+  race against nothing and exhausted retries), so this path does a plain
+  unconditional put instead. That re-opens a narrow race window, but only
+  for the very first commit of a graph nobody has written to yet — two
+  simultaneous first-ever writers is a vanishingly rare coincidence, and
+  even then exactly one commit (not accumulated history) is at risk, unlike
+  the accumulating-history loss the etag-guarded path (the common case,
+  every write after the first) closes. → Promise<boolean> (true = written,
+  false = lost the race — caller must re-read the now-current head and
+  retry)."
   [^js bucket k chain etag]
-  (-> (.put bucket k chain
-           #js {:onlyIf #js {:etagMatches (or etag "")}})
-      (.then (fn [result] (boolean result)))))
+  (if (nil? etag)
+    (-> (.put bucket k chain) (.then (fn [_] true)))
+    (-> (.put bucket k chain #js {:onlyIf #js {:etagMatches etag}})
+        (.then (fn [result] (boolean result))))))

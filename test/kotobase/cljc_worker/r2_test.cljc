@@ -48,8 +48,13 @@
 ;; Mirrors just enough of the real R2Bucket surface (.get/.put, R2Object with
 ;; .text()/.etag) to prove r2-get-head/r2-put-head-if-match's contract without
 ;; a live Cloudflare binding — a new etag is minted on every successful put
-;; (like a real object store), so a stale reader's put is REJECTED, never
-;; silently accepted.
+;; (like a real object store). CRITICAL fidelity point (a live-tested lesson,
+;; not a guess): a put with NO onlyIf condition is UNCONDITIONAL — it must
+;; always succeed, even overwriting an existing object — R2 has no implicit
+;; "if absent" behavior. An earlier version of this mock got this wrong
+;; (treated a missing onlyIf the same as onlyIf.etagMatches ""), which let a
+;; test pass against a fake that DIDN'T match real R2 semantics while the
+;; equivalent live code path failed every single first-write-to-a-new-graph.
 
 (defn- make-fake-bucket []
   (let [store (atom {})            ; key -> {:value :etag}
@@ -60,10 +65,10 @@
                    #js {:text (fn [] (js/Promise.resolve value)) :etag etag})))
          :put (fn [k v ^js opts]
                 (js/Promise.resolve
-                 (let [required (some-> opts .-onlyIf .-etagMatches)
-                       current  (:etag (get @store k))]
-                   (if (not= (or required "") (or current ""))
-                     nil        ; real R2: onlyIf failed -> resolves null, no write
+                 (let [required (some-> opts .-onlyIf .-etagMatches)]
+                   (if (and (some? required)
+                            (not= required (:etag (get @store k))))
+                     nil        ; onlyIf.etagMatches present AND mismatched -> reject
                      (let [new-etag (str "etag-" (swap! etag-seq inc))]
                        (swap! store assoc k {:value v :etag new-etag})
                        #js {:etag new-etag})))))
@@ -84,18 +89,44 @@
                    (is (some? etag))
                    (done)))))))
 
-(deftest r2-put-head-if-match-rejects-on-stale-etag
+(deftest r2-put-head-if-match-nil-etag-is-unconditional
+  ;; The documented, accepted narrow race: a nil etag (no prior read, or the
+  ;; key was absent) writes unconditionally — this is the ONLY path where two
+  ;; writers can race undetected, and only for the very first commit of a
+  ;; graph, never for accumulated history (every subsequent write goes
+  ;; through the real-etag CAS path below).
   (async done
     (let [bucket (make-fake-bucket)]
       (-> (r2/r2-put-head-if-match bucket "heads/g1" "chainA" nil)
-          (.then (fn [ok?] (is ok? "first create-if-absent write succeeds")))
-          ;; a second writer racing off the SAME (now-stale) nil etag must lose
-          (.then (fn [_] (r2/r2-put-head-if-match bucket "heads/g1" "chainB-stale" nil)))
+          (.then (fn [ok?] (is ok? "first write succeeds")))
+          (.then (fn [_] (r2/r2-put-head-if-match bucket "heads/g1" "chainB" nil)))
           (.then (fn [ok?]
-                   (is (false? ok?) "a second create-if-absent after the key exists is rejected")
+                   (is ok? "a nil-etag put is unconditional — it overwrites, it does not reject")
                    (r2/r2-get-head bucket "heads/g1")))
           (.then (fn [{:keys [chain]}]
-                   (is (= "chainA" chain) "the rejected writer never clobbered the winner")
+                   (is (= "chainB" chain) "the second (unconditional) writer wins, as expected")
+                   (done)))))))
+
+(deftest r2-put-head-if-match-rejects-on-stale-etag
+  ;; The case that actually matters at real write volume: EVERY write after
+  ;; the first carries a real etag from its own head read, and a stale one
+  ;; (someone else committed in between) must be rejected, not silently
+  ;; accepted.
+  (async done
+    (let [bucket (make-fake-bucket)]
+      (-> (r2/r2-put-head-if-match bucket "heads/g1" "chainA" nil)
+          (.then (fn [_] (r2/r2-get-head bucket "heads/g1")))
+          (.then (fn [{:keys [etag]}]
+                   ;; a THIRD writer commits in between, advancing the head
+                   (-> (r2/r2-put-head-if-match bucket "heads/g1" "chainB" etag)
+                       (.then (fn [ok?] (is ok? "the in-between writer succeeds")))
+                       ;; now a STALE writer retries its put with the OLD etag
+                       (.then (fn [_] (r2/r2-put-head-if-match bucket "heads/g1" "chainC-stale" etag))))))
+          (.then (fn [ok?]
+                   (is (false? ok?) "a write against a now-stale etag is rejected")
+                   (r2/r2-get-head bucket "heads/g1")))
+          (.then (fn [{:keys [chain]}]
+                   (is (= "chainB" chain) "the rejected stale writer never clobbered the winner")
                    (done)))))))
 
 (deftest r2-put-head-if-match-two-racers-exactly-one-wins
