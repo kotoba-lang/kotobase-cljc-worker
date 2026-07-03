@@ -98,33 +98,73 @@
                    (h/handle {:get-fn sync-get :head-get (constantly head-chain)}
                              method body nil)))))))
 
-(defn- run-transact
-  "transact: trampoline the hydrate READ, BUFFER all new blocks in memory, then
-  flush the buffer to R2 and advance the graph head — R2 writes happen after the
-  sync commit, never mid-walk."
+(defn- delay-ms [ms] (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+
+(def ^:private max-head-cas-attempts
+  "Every com.atproto.repo.createRecord across every actor lands on the SAME
+  operator-identity yoro-social graph (ADR-2607022330 addendum 3), so
+  contention is the common case under any real write volume, not a tail
+  edge case — sized generously rather than tuned to a specific observed
+  burst width."
+  8)
+
+(defn- flush-blocks-and-cas-head!
+  "After a successful pure transact: flush the buffered blocks (always safe
+  to write even on an eventual CAS loss — content-addressed, so a retry's
+  blocks are either identical or simply orphaned, never corrupting), then
+  attempt the conditional head write. → Promise<{:resp map :cas-ok? bool}>."
+  [^js bucket pfx graph etag resp buffer]
+  (if-not (:ok resp)
+    (js/Promise.resolve {:resp resp :cas-ok? true})   ; real error, not a race — don't retry
+    (-> (js/Promise.all
+         (clj->js (map (fn [[cid bytes]] (r2/r2-put-bytes bucket (r2/block-key pfx cid) bytes))
+                       @buffer)))
+        (.then (fn [_] (r2/r2-put-head-if-match bucket (r2/head-key pfx graph) (:commit resp) etag)))
+        (.then (fn [cas-ok?] {:resp resp :cas-ok? cas-ok?})))))
+
+(defn- run-transact-attempt
+  "One CAS round: read the head + its etag, run the pure handler against
+  that snapshot, then flush-blocks-and-cas-head!. → Promise<{:resp map
+  :cas-ok? bool}>; :cas-ok? false means another writer's head update landed
+  first — the caller retries from a fresh head read."
   [^js bucket pfx body auth-did]
   (let [buffer (atom {})
         graph  (:graph body)]
-    (-> (r2/r2-get-text bucket (r2/head-key pfx graph))
-        (.then (fn [head-chain]
-                 (r2/with-blocks
-                   (fn [cid] (r2/r2-get-bytes bucket (r2/block-key pfx cid)))
-                   (fn [sync-get]
-                     (h/handle {:get-fn sync-get
-                                :put! (fn [cid bytes] (swap! buffer assoc cid bytes))
-                                :head-get (constantly head-chain)
-                                :head-put! (fn [_ _] nil)}      ; head flushed below
-                               "transact" body auth-did)))))
-        (.then (fn [resp]
-                 (if-not (:ok resp)
-                   resp
-                   ;; flush buffered blocks, then the new head, then reply
-                   (-> (js/Promise.all
-                        (clj->js (map (fn [[cid bytes]]
-                                        (r2/r2-put-bytes bucket (r2/block-key pfx cid) bytes))
-                                      @buffer)))
-                       (.then (fn [_] (.put bucket (r2/head-key pfx graph) (:commit resp))))
-                       (.then (fn [_] resp)))))))))
+    (-> (r2/r2-get-head bucket (r2/head-key pfx graph))
+        (.then (fn [{:keys [chain etag]}]
+                 (-> (r2/with-blocks
+                      (fn [cid] (r2/r2-get-bytes bucket (r2/block-key pfx cid)))
+                      (fn [sync-get]
+                        (h/handle {:get-fn sync-get
+                                   :put! (fn [cid bytes] (swap! buffer assoc cid bytes))
+                                   :head-get (constantly chain)
+                                   :head-put! (fn [_ _] nil)}   ; head CAS'd below
+                                  "transact" body auth-did)))
+                     (.then (fn [resp] (flush-blocks-and-cas-head! bucket pfx graph etag resp buffer)))))))))
+
+(defn- run-transact
+  "transact: CAS-guarded head advance (see run-transact-attempt) with retry
+  on lost races — never silently drops a commit whose blocks made it to R2;
+  either the head lands or the caller gets ConcurrentWriteConflict after
+  exhausting retries (loud failure beats silent data loss). Closes a real,
+  confirmed-live race: every actor's createRecord lands on the SAME shared
+  operator-identity graph, so overlapping transacts (worker slowness widens
+  the window; the PDS's own relay-ingest cron writes the same graph too)
+  raced the OLD unconditional head .put — whichever landed last silently
+  orphaned the other's commit (blocks stayed in R2, never corrupted, just
+  unreachable from the head chain). See ADR-2607022330 addendum 3."
+  ([bucket pfx body auth-did] (run-transact bucket pfx body auth-did 1))
+  ([^js bucket pfx body auth-did attempt]
+   (-> (run-transact-attempt bucket pfx body auth-did)
+       (.then (fn [{:keys [resp cas-ok?]}]
+                (cond
+                  cas-ok? resp
+                  (>= attempt max-head-cas-attempts)
+                  {:ok false :error "ConcurrentWriteConflict"
+                   :message (str "head CAS lost the race " attempt " times")}
+                  :else
+                  (-> (delay-ms (min 800 (* 50 attempt)))
+                      (.then (fn [_] (run-transact bucket pfx body auth-did (inc attempt)))))))))))
 
 ;; ── dispatch ─────────────────────────────────────────────────────────────────
 
