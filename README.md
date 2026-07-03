@@ -6,17 +6,30 @@ rehydrated + serialised the WHOLE graph on every `datomic.datoms` read — the
 "Invalid array buffer length" 500 that OOMs at the 128 MB isolate ceiling as
 `yoro-social` grows (root cause: ADR-2607022330 addendum 2).
 
-This worker serves `ai.gftd.apps.kotobase.datomic.{datoms,transact,q,pull}` on
-the CLJC `kotobase-engine`, so a filtered read touches only the matching
-entity/attr:
+This worker serves `ai.gftd.apps.kotobase.datomic.{datoms,transact,q,pull,fold}`
+on the CLJC `kotobase-engine`, so a filtered read touches only the matching
+entity/attr and a write's cost never depends on graph size
+(ADR-2607032430 D1 — log-structured write path, replacing the O(graph)
+hydrate+rebuild that hit Cloudflare Workers' CPU limit under 2026-07-03's
+mass-write load):
 
-- **datoms** → `kotobase-engine.core/cold-datoms`: decode the graph's snapshot
-  index-roots, prefix-seek the ONE index the query needs (`:eavt`/`:aevt`/`:avet`
-  + ordered `components` + `limit`). Never rehydrates the whole db.
-- **transact** → `hydrate-db` (one index, ~1×) → assert → `commit!` → advance
-  head. CACAO-verified (issuer must own the graph), byte-exact with the PDS via
-  `kotobase.cacao`.
-- **q/pull** → hydrate then route through kqe / fold entity attrs.
+- **transact** → `kotobase-engine.core/commit!`: appends the tx quads as ONE
+  novelty block. O(|tx_edn|), independent of graph size — never hydrates,
+  never rebuilds an index. CACAO-verified (issuer must own the graph),
+  byte-exact with the PDS via `kotobase.cacao`.
+- **datoms/pull** → `kotobase-engine.core/hot-datoms`: merges the graph's
+  last-folded snapshot (range-pruned index-root prefix-seek — `:eavt`/`:aevt`/
+  `:avet` + ordered `components` + `limit`) with any pending novelty (bounded,
+  decoded in memory). Never misses data written since the last fold.
+- **q** → rebuilds a hot db from snapshot+novelty, routes through kqe
+  (triple-pattern scope, unchanged).
+- **fold** → `kotobase-engine.core/fold!`: compacts a graph's novelty into a
+  fresh indexed snapshot. NOT part of the datomic surface proper — a
+  maintenance operation an authorized cron/ops caller invokes (not
+  necessarily the graph owner) to keep reads fast as novelty accumulates.
+  Never triggered inline by a transact, so no single write's CPU budget can
+  include an O(graph) compaction — that's precisely what broke under load
+  before this landed.
 
 ## Architecture
 

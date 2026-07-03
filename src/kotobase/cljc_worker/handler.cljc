@@ -36,66 +36,101 @@
       ;; consumers key on ":ns/attr" (with the colon), so keep it verbatim.
       {:s (str s) :p (str k) :o (str v)})))
 
-;; ── read/write against the graph's persisted chain ──────────────────────────
-
-(defn- snapshot-of [store graph]
-  (when-let [chain (:head-get store)]
-    (some->> (chain graph) (eng/latest-snapshot-cid (:get-fn store)))))
+;; ── read/write against the graph's persisted chain (ADR-2607032430 D1) ──────
+;; The chain's head IS the unit of state now (snapshot + pending novelty), not
+;; just its folded snapshot — every read goes through `eng/hot-datoms` so it
+;; never misses data written since the last fold. `do-transact` never hydrates
+;; the graph: it appends one novelty tx block (O(|tx|), independent of graph
+;; size — the fix for the 2026-07-03 CPU-limit collapse). Folding is a
+;; separate, explicit operation (`do-fold`) a cron/ops caller invokes — never
+;; inline in a write's own request, so no single write's latency/CPU budget
+;; can include an O(graph) compaction.
 
 (defn- index-kw [index]
   (when (seq index) (keyword (cond-> index (str/starts-with? index ":") (subs 1)))))
 
 (defn do-datoms
-  "`datomic.datoms` — filtered read via cold-datoms (never rehydrates the db).
-  body: {:graph :index :components_edn :limit}."
+  "`datomic.datoms` — filtered read via hot-datoms (snapshot + novelty merge,
+  range-pruned on the snapshot side; never a whole-graph rehydrate). body:
+  {:graph :index :components_edn :limit}."
   [store {:keys [graph index components_edn limit]}]
-  (let [snap (snapshot-of store graph)]
-    (if (nil? snap)
-      {:ok true :graph graph :datoms []}
-      {:ok true :graph graph
-       :datoms (eng/cold-datoms (:get-fn store) snap
-                                {:index (or (index-kw index) :eavt)
-                                 :components (vec components_edn)
-                                 :limit limit})})))
+  (let [chain ((:head-get store) graph)]
+    {:ok true :graph graph
+     :datoms (eng/hot-datoms (:get-fn store) chain
+                             {:index (or (index-kw index) :eavt)
+                              :components (vec components_edn)
+                              :limit limit})}))
 
 (defn do-transact
-  "`datomic.transact` — hydrate the graph's db (~1×), assert the tx quads, commit,
-  advance the head. `auth-did` is the CACAO-verified issuer (the shell verifies it
-  == graph owner); nil here means the shell already gated it."
+  "`datomic.transact` — append the tx quads as ONE novelty block and advance
+  the chain. O(|tx_edn|) — independent of graph size; never hydrates or
+  rebuilds an index (ADR-2607032430 D1, replacing the old hydrate+rebuild
+  path that hit Cloudflare Workers' CPU limit under mass-write load).
+  `auth-did` is the CACAO-verified issuer (the shell verifies it == graph
+  owner); nil here means the shell already gated it. `novelty_size` in the
+  response is an observability signal for when a `fold` (see `do-fold`) is
+  worth invoking — this handler never folds itself."
   [store {:keys [graph tx_edn]} _auth-did]
   (let [get-fn (:get-fn store)
         prev-chain ((:head-get store) graph)
-        prev-snap  (some->> prev-chain (eng/latest-snapshot-cid get-fn))
-        db  (-> (eng/hydrate-db get-fn prev-snap)
-                (eng/transact (tx-edn->quads tx_edn)))
-        chain (eng/commit! (:put! store) get-fn db prev-chain)]
+        quads (tx-edn->quads tx_edn)
+        chain (eng/commit! (:put! store) get-fn quads prev-chain)]
     ((:head-put! store) graph chain)
     {:ok true :graph graph :commit chain
-     :datom_count (count (eng/datoms db))}))
+     :datom_count (count quads)
+     :novelty_size (eng/novelty-size get-fn chain)}))
+
+(defn- hot-db
+  "The full hot db as of `chain` (snapshot + novelty merged) — for `do-q`,
+  which needs an actual db value to route a multi-attribute pattern through
+  kqe. Composed entirely from kotobase-engine's public API (hot-datoms +
+  transact), so it stays correct against novelty without kotobase-engine
+  needing its own db-shaped 'hot-db' primitive."
+  [get-fn chain]
+  (eng/transact (eng/empty-db)
+                (map (fn [{:keys [e a v_edn]}] {:s e :p a :o (edn/read-string v_edn)})
+                     (eng/hot-datoms get-fn chain))))
 
 (defn do-q
-  "`datomic.q` — triple-pattern query. Hydrates the graph's db (writes are rarer
-  than the hammered keyed reads this worker fixes) then routes through kqe. body:
-  {:graph :query_edn} where query_edn is a `[s p o]` pattern (nil = wildcard)."
+  "`datomic.q` — triple-pattern query. Rebuilds a hot db from snapshot+novelty
+  (writes are rarer than the hammered keyed reads this worker fixes; q's
+  multi-clause-free triple-pattern scope is already O(graph), unchanged by
+  D1) then routes through kqe. body: {:graph :query_edn} where query_edn is a
+  `[s p o]` pattern (nil = wildcard)."
   [store {:keys [graph query_edn]}]
-  (let [snap (snapshot-of store graph)
-        db   (eng/hydrate-db (:get-fn store) snap)
-        pat  (edn/read-string query_edn)]
+  (let [chain ((:head-get store) graph)
+        db    (hot-db (:get-fn store) chain)
+        pat   (edn/read-string query_edn)]
     {:ok true :graph graph :rows (vec (eng/q db pat))}))
 
 (defn do-pull
-  "`datomic.pull` — all attrs of one entity. body: {:graph :entity}."
+  "`datomic.pull` — all attrs of one entity, via hot-datoms (snapshot +
+  novelty merge). body: {:graph :entity}."
   [store {:keys [graph entity]}]
-  (let [snap (snapshot-of store graph)]
-    {:ok true :graph graph
-     :entity entity
-     :attrs (if (nil? snap)
-              {}
-              ;; entity's datoms via the eavt prefix, folded into {attr [vals]}
-              (reduce (fn [m {:keys [a v_edn]}] (update m a (fnil conj []) v_edn))
-                      {}
-                      (eng/cold-datoms (:get-fn store) snap
-                                       {:index :eavt :components [entity]})))}))
+  (let [chain ((:head-get store) graph)
+        rows  (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]})]
+    {:ok true :graph graph :entity entity
+     :attrs (reduce (fn [m {:keys [a v_edn]}] (update m a (fnil conj []) v_edn)) {} rows)}))
+
+(defn do-fold
+  "`datomic.fold` — compacts a graph's accumulated novelty into a fresh
+  indexed snapshot (ADR-2607032430 D1 `fold!`). Not part of the datomic
+  surface proper — a maintenance operation a cron/ops caller invokes to keep
+  `hot-datoms`/`do-q` reads fast as novelty grows. `:commit` is absent (no
+  head write attempted) when there's nothing to fold, so a redundant/no-op
+  call is cheap and doesn't perturb the head. Safe to call anytime, including
+  concurrently with a transact or with another fold of the same graph — fold!
+  is deterministic/content-addressed, so races converge rather than corrupt
+  (the CAS layer in the worker shell resolves any actual head contention)."
+  [store {:keys [graph]}]
+  (let [get-fn (:get-fn store)
+        chain ((:head-get store) graph)
+        novelty-n (if chain (eng/novelty-size get-fn chain) 0)]
+    (if (zero? novelty-n)
+      {:ok true :graph graph :folded false}
+      (let [new-chain (eng/fold! (:put! store) get-fn chain)]
+        ((:head-put! store) graph new-chain)
+        {:ok true :graph graph :folded true :commit new-chain :novelty_folded novelty-n}))))
 
 ;; ── dispatch ─────────────────────────────────────────────────────────────────
 
@@ -111,6 +146,7 @@
       "transact" (do-transact store body auth-did)
       "q"        (do-q store body)
       "pull"     (do-pull store body)
+      "fold"     (do-fold store body)
       {:ok false :error "MethodNotImplemented" :method method})
     (catch #?(:clj Exception :cljs :default) e
       ;; the R2 trampoline's cache-miss must propagate to with-blocks, NOT be
