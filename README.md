@@ -46,7 +46,7 @@ mass-write load):
   read (trampoline) and write (buffer new blocks → flush → advance head).
 
 The dep chain (`kotobase-peer`, `arrangement` — formerly two repos,
-quad-store + kqe, merged; ADR-2607050600 — `prolly-tree`, `commit-dag`,
+quad-store + kqe, merged; ADR-2607050700 — `prolly-tree`, `commit-dag`,
 `ipld`, `multiformats`, `dag-cbor`) + `kotobase-client` (CACAO/cid) are
 consumed as west-sibling shadow-cljs source-paths (`../<dep>/src`).
 

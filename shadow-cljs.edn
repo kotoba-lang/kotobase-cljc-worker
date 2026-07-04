@@ -8,7 +8,7 @@
 {:source-paths
  ["src" "test"
   ;; kotobase-engine -> kotobase-peer, quad-store+kqe -> arrangement
-  ;; (ADR-2607050600)
+  ;; (ADR-2607050700)
   "../kotobase-peer/src"
   "../datom/src"          ; canonical datom model (datom.core), consumed by the peer library
   "../arrangement/src"
