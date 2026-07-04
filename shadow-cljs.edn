@@ -7,10 +7,11 @@
 ;; relative to orgs/kotoba-lang/kotobase-cljc-worker → orgs/kotoba-lang/<dep>.
 {:source-paths
  ["src" "test"
-  "../kotobase-engine/src"
-  "../datom/src"          ; canonical datom model (datom.core), consumed by the engine
-  "../kqe/src"
-  "../quad-store/src"
+  ;; kotobase-engine -> kotobase-peer, quad-store+kqe -> arrangement
+  ;; (ADR-2607050600)
+  "../kotobase-peer/src"
+  "../datom/src"          ; canonical datom model (datom.core), consumed by the peer library
+  "../arrangement/src"
   "../prolly-tree/src"
   "../commit-dag/src"
   "../ipld/src"

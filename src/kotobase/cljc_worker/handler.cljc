@@ -15,7 +15,7 @@
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
             [clojure.string :as str]
-            [kotobase-engine.core :as eng]))
+            [kotobase-peer.core :as eng]))
 
 (def datomic-ns "ai.gftd.apps.kotobase.datomic")
 
@@ -81,9 +81,9 @@
 (defn- hot-db
   "The full hot db as of `chain` (snapshot + novelty merged) — for `do-q`,
   which needs an actual db value to route a multi-attribute pattern through
-  kqe. Composed entirely from kotobase-engine's public API (hot-datoms +
-  transact), so it stays correct against novelty without kotobase-engine
-  needing its own db-shaped 'hot-db' primitive."
+  arrangement.query. Composed entirely from kotobase-peer's public API
+  (hot-datoms + transact), so it stays correct against novelty without
+  kotobase-peer needing its own db-shaped 'hot-db' primitive."
   [get-fn chain]
   (eng/transact (eng/empty-db)
                 (map (fn [{:keys [e a v_edn]}] {:s e :p a :o (edn/read-string v_edn)})
@@ -93,13 +93,19 @@
   "`datomic.q` — triple-pattern query. Rebuilds a hot db from snapshot+novelty
   (writes are rarer than the hammered keyed reads this worker fixes; q's
   multi-clause-free triple-pattern scope is already O(graph), unchanged by
-  D1) then routes through kqe. body: {:graph :query_edn} where query_edn is a
-  `[s p o]` pattern (nil = wildcard)."
+  D1) then routes through arrangement.query. body: {:graph :query_edn} where
+  query_edn is a `[s p o]` pattern (nil = wildcard).
+
+  `eng/q`'s `visible?` is required (ADR-2607050500: Query is a first-class
+  effect) -- this handler has no capability/purpose-scoped redaction wired
+  in yet (tracked as ADR-2607050500 Phase 3, not done here), so it passes
+  `(constantly true)` explicitly: today's behavior is unchanged (every
+  matching quad visible), stated instead of assumed."
   [store {:keys [graph query_edn]}]
   (let [chain ((:head-get store) graph)
         db    (hot-db (:get-fn store) chain)
         pat   (edn/read-string query_edn)]
-    {:ok true :graph graph :rows (vec (eng/q db pat))}))
+    {:ok true :graph graph :rows (vec (eng/q db pat (constantly true)))}))
 
 (defn do-pull
   "`datomic.pull` — all attrs of one entity, via hot-datoms (snapshot +

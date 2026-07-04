@@ -2,7 +2,7 @@
   (:require #?(:clj  [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotobase.cljc-worker.handler :as h]
-            [kotobase-engine.core :as eng]))
+            [kotobase-peer.core :as eng]))
 
 (defn- mem-store []
   (let [blocks (atom {}) heads (atom {})]
