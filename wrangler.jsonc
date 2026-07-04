@@ -5,7 +5,7 @@
   //
   // Serves kotobase.aozora.app (moved off the WASM worker 2026-07-02): the owner
   // authorized discarding the old Rust-format data and adopting the CLJC
-  // prolly/commit-dag format, so yoro-social starts fresh under the `kotobase/cljc`
+  // prolly/chain format, so yoro-social starts fresh under the `kotobase/cljc`
   // R2 prefix. Rollback = move this custom_domain route back to the WASM worker.
   "name": "kotobase-cljc-worker",
   "main": "out/worker.js",
@@ -19,7 +19,7 @@
     { "binding": "BUCKET", "bucket_name": "kotobase-wasm-staging" }
   ],
   "vars": {
-    // NEW prefix — the CLJC prolly/commit-dag block format is incompatible with
+    // NEW prefix — the CLJC prolly/chain block format is incompatible with
     // the Rust WASM format under kotobase/wasm-staging, so it lives separately
     // and the old data stays intact for rollback.
     // v2 = a fresh namespace after the relay-cron bloat was cleared (the cron

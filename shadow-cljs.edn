@@ -8,12 +8,12 @@
 {:source-paths
  ["src" "test"
   ;; kotobase-engine -> kotobase-peer, quad-store+kqe -> arrangement
-  ;; (ADR-2607050700)
+  ;; (ADR-2607050700); commit-dag -> chain (ADR-2607050800)
   "../kotobase-peer/src"
   "../datom/src"          ; canonical datom model (datom.core), consumed by the peer library
   "../arrangement/src"
   "../prolly-tree/src"
-  "../commit-dag/src"
+  "../chain/src"
   "../ipld/src"
   "../multiformats/src"
   "../dag-cbor/src"

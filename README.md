@@ -46,9 +46,10 @@ mass-write load):
   read (trampoline) and write (buffer new blocks → flush → advance head).
 
 The dep chain (`kotobase-peer`, `arrangement` — formerly two repos,
-quad-store + kqe, merged; ADR-2607050700 — `prolly-tree`, `commit-dag`,
-`ipld`, `multiformats`, `dag-cbor`) + `kotobase-client` (CACAO/cid) are
-consumed as west-sibling shadow-cljs source-paths (`../<dep>/src`).
+quad-store + kqe, merged; ADR-2607050700 — `prolly-tree`, `chain`
+(renamed from `commit-dag`, ADR-2607050800), `ipld`, `multiformats`,
+`dag-cbor`) + `kotobase-client` (CACAO/cid) are consumed as west-sibling
+shadow-cljs source-paths (`../<dep>/src`).
 
 ## Build / test
 
@@ -60,7 +61,7 @@ npx shadow-cljs release worker # → out/worker.js (:esm)
 
 ## Deploy — GATED on the yoro-social migration (do NOT flip the route blindly)
 
-The CLJC prolly/commit-dag block format is **incompatible** with the live Rust
+The CLJC prolly/chain block format is **incompatible** with the live Rust
 WASM R2 data (`kotobase/wasm-staging`), so cutover is a one-time migration, not a
 route flip:
 
