@@ -1,7 +1,7 @@
 (ns kotobase.cljc-worker.r2-test
   (:require [cljs.test :refer [deftest is testing async]]
             [kotobase.cljc-worker.r2 :as r2]
-            [kotobase-engine.core :as eng]))
+            [kotobase-peer.core :as eng]))
 
 (deftest with-blocks-bridges-async-r2-to-sync-cold-datoms
   ;; Persist a snapshot into an in-memory block map, then serve those blocks
