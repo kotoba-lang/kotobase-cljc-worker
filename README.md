@@ -20,12 +20,17 @@ mass-write load):
 - **datoms/pull** → `kotobase-peer.core/hot-datoms`: merges the graph's
   last-folded snapshot (range-pruned index-root prefix-seek — `:eavt`/`:aevt`/
   `:avet` + ordered `components` + `limit`) with any pending novelty (bounded,
-  decoded in memory). Never misses data written since the last fold.
+  decoded in memory). Never misses data written since the last fold. Passes
+  `(constantly true)` for `hot-datoms`'s required `visible?` — same
+  convention as `q`, below.
 - **q** → rebuilds a hot db from snapshot+novelty, routes through
   `arrangement.query` (triple-pattern scope, unchanged). Passes
   `(constantly true)` for `q`'s required `visible?` (ADR-2607050500) —
   no capability/purpose-scoped redaction wired into this worker yet
-  (tracked as Phase 3, not silently dropped).
+  (tracked as Phase 3, not silently dropped). `hot-datoms`/`cold-datoms`/
+  `datoms` all gained the same required-`visible?` treatment as a Phase 3
+  follow-up (`kotobase-peer`'s own PR); this worker passes `(constantly
+  true)` there too, for the same reason.
 - **fold** → `kotobase-peer.core/fold!`: compacts a graph's novelty into a
   fresh indexed snapshot. NOT part of the datomic surface proper — a
   maintenance operation an authorized cron/ops caller invokes (not
