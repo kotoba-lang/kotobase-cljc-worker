@@ -19,10 +19,11 @@
           snap  (eng/latest-snapshot-cid sync-get chain)
           ;; async R2 fetch: resolve the block on a microtask
           fetch1 (fn [cid] (js/Promise.resolve (get @blocks cid)))
+          everything (constantly true)
           direct (eng/cold-datoms sync-get snap
-                                  {:index :eavt :components ["keybackup/zA"]})]
+                                  {:index :eavt :components ["keybackup/zA"]} everything)]
       (-> (r2/with-blocks fetch1
-            (fn [g] (eng/cold-datoms g snap {:index :eavt :components ["keybackup/zA"]})))
+            (fn [g] (eng/cold-datoms g snap {:index :eavt :components ["keybackup/zA"]} everything)))
           (.then (fn [via-r2]
                    (is (= (set direct) (set via-r2)) "async-R2 read == sync read")
                    (is (= 2 (count via-r2)))
@@ -30,7 +31,8 @@
                    (r2/with-blocks fetch1
                      (fn [g] (eng/cold-datoms g snap
                                               {:index :avet
-                                               :components [":aozora.keyBackup/did" "did:key:zB"]})))))
+                                               :components [":aozora.keyBackup/did" "did:key:zB"]}
+                                              everything)))))
           (.then (fn [rows]
                    (is (= [{:e "keybackup/zB" :a ":aozora.keyBackup/did"
                             :v_edn "\"did:key:zB\"" :added true}] rows))

@@ -50,14 +50,21 @@
 (defn do-datoms
   "`datomic.datoms` — filtered read via hot-datoms (snapshot + novelty merge,
   range-pruned on the snapshot side; never a whole-graph rehydrate). body:
-  {:graph :index :components_edn :limit}."
+  {:graph :index :components_edn :limit}.
+
+  `eng/hot-datoms`'s `visible?` is required (ADR-2607050500, same reasoning
+  as `do-q`'s `eng/q` call below) -- this handler has no capability/purpose-
+  scoped redaction wired in yet (ADR-2607050500 Phase 3, not done here), so
+  it passes `(constantly true)` explicitly: today's behavior is unchanged,
+  stated instead of assumed."
   [store {:keys [graph index components_edn limit]}]
   (let [chain ((:head-get store) graph)]
     {:ok true :graph graph
      :datoms (eng/hot-datoms (:get-fn store) chain
                              {:index (or (index-kw index) :eavt)
                               :components (vec components_edn)
-                              :limit limit})}))
+                              :limit limit}
+                             (constantly true))}))
 
 (defn do-transact
   "`datomic.transact` — append the tx quads as ONE novelty block and advance
@@ -83,11 +90,15 @@
   which needs an actual db value to route a multi-attribute pattern through
   arrangement.query. Composed entirely from kotobase-peer's public API
   (hot-datoms + transact), so it stays correct against novelty without
-  kotobase-peer needing its own db-shaped 'hot-db' primitive."
+  kotobase-peer needing its own db-shaped 'hot-db' primitive.
+
+  Passes `(constantly true)` for `hot-datoms`'s required `visible?` (see
+  `do-q`'s own `eng/q` call, below, for why: no capability/purpose-scoped
+  redaction is wired into this handler yet, ADR-2607050500 Phase 3)."
   [get-fn chain]
   (eng/transact (eng/empty-db)
                 (map (fn [{:keys [e a v_edn]}] {:s e :p a :o (edn/read-string v_edn)})
-                     (eng/hot-datoms get-fn chain))))
+                     (eng/hot-datoms get-fn chain (constantly true)))))
 
 (defn do-q
   "`datomic.q` — triple-pattern query. Rebuilds a hot db from snapshot+novelty
@@ -109,10 +120,14 @@
 
 (defn do-pull
   "`datomic.pull` — all attrs of one entity, via hot-datoms (snapshot +
-  novelty merge). body: {:graph :entity}."
+  novelty merge). body: {:graph :entity}.
+
+  Same `(constantly true)` `visible?` convention as `do-datoms`/`hot-db`,
+  above (ADR-2607050500 Phase 3 redaction not wired in yet)."
   [store {:keys [graph entity]}]
   (let [chain ((:head-get store) graph)
-        rows  (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]})]
+        rows  (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
+                              (constantly true))]
     {:ok true :graph graph :entity entity
      :attrs (reduce (fn [m {:keys [a v_edn]}] (update m a (fnil conj []) v_edn)) {} rows)}))
 
