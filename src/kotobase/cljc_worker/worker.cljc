@@ -125,12 +125,33 @@
         (.then (fn [_] (r2/r2-put-head-if-match bucket (r2/head-key pfx graph) (:commit resp) etag)))
         (.then (fn [cas-ok?] {:resp resp :cas-ok? cas-ok?})))))
 
-(defn- run-write-attempt
+(defn run-write-attempt
   "One CAS round for a head-mutating method (transact or fold): read the
   head + its etag, run the pure handler against that snapshot, then
   flush-blocks-and-cas-head!. → Promise<{:resp map :cas-ok? bool}>;
   :cas-ok? false means another writer's head update landed first — the
-  caller retries from a fresh head read."
+  caller retries from a fresh head read.
+
+  :get-fn is a read-your-own-writes merge of `buffer` (this call's own
+  not-yet-flushed :put!s) over the with-blocks trampoline, NOT the
+  trampoline alone (INCIDENT 2607032800, \"worker commit! null.length\"):
+  do-transact's own novelty_size re-reads the chain-cid it JUST committed
+  before this fn ever flushes it to R2. Without the merge, with-blocks'
+  sync-get throws missing-block (nothing cached yet) on that cid, the
+  trampoline fetches it from R2 — a genuine miss, the block only exists in
+  `buffer` — caches the miss AS nil, and retries; the retry's sync-get
+  then returns nil WITHOUT throwing (nil is a cached hit), and
+  ipld/decode nil crashes with `Cannot read properties of null (reading
+  'length')`. handler.cljc's try/catch has no :block-miss on THAT
+  exception (a plain TypeError, not a missing-block ex-info), so it's
+  swallowed into a normal-looking `{:ok false :error \"InternalError\"
+  ...}` response instead of a promise rejection — do-transact silently
+  fails this way on every call, and do-fold hits the identical pattern
+  reading back its own fold!-written blocks (the reason
+  FOLD_CRON_ENABLED was left at 0 downstream in app-aozora).
+  Reproduced independent of R2 (a pure-Node repro against ANY genuinely
+  async store hits the same crash) and fixed the same way in this repo's
+  sibling browser shell, kotoba-lang/kotobase-browser-worker."
   [^js bucket pfx method body auth-did]
   (let [buffer (atom {})
         graph  (:graph body)]
@@ -139,14 +160,16 @@
                  (-> (r2/with-blocks
                       (fn [cid] (r2/r2-get-bytes bucket (r2/block-key pfx cid)))
                       (fn [sync-get]
-                        (h/handle {:get-fn sync-get
+                        (h/handle {:get-fn (fn [cid] (if (contains? @buffer cid)
+                                                        (get @buffer cid)
+                                                        (sync-get cid)))
                                    :put! (fn [cid bytes] (swap! buffer assoc cid bytes))
                                    :head-get (constantly chain)
                                    :head-put! (fn [_ _] nil)}   ; head CAS'd below
                                   method body auth-did)))
                      (.then (fn [resp] (flush-blocks-and-cas-head! bucket pfx graph etag resp buffer)))))))))
 
-(defn- run-write
+(defn run-write
   "transact/fold: CAS-guarded head advance (see run-write-attempt) with
   retry on lost races — never silently drops a commit whose blocks made it
   to R2; either the head lands or the caller gets ConcurrentWriteConflict
