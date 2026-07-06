@@ -51,6 +51,7 @@
 
 (defn block-key [prefix cid] (str prefix "blocks/" cid))
 (defn head-key  [prefix graph] (str prefix "heads/" (str/replace graph #"[^A-Za-z0-9._:-]" "_")))
+(defn ipns-key  [prefix name] (str prefix "ipns/" (str/replace name #"[^A-Za-z0-9._:-]" "_")))
 
 (defn r2-get-bytes
   "→ Promise<Uint8Array|nil> for an R2 object key."

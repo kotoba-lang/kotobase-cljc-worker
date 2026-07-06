@@ -39,6 +39,25 @@ mass-write load):
   include an O(graph) compaction — that's precisely what broke under load
   before this landed.
 
+Also serves `com.etzhayyim.apps.kotoba.ipns.{head,publish}` (ADR-2607061800)
+— a separate NSID family with a genuinely different trust model from the
+datomic surface above: **unauthenticated, self-verifying reads** (`head`)
+and **signature-gated writes** (`publish`, no CACAO — authority is the
+Ed25519 signature over the record itself, checked server-side via
+`kotobase.ipns/verify-head` before it ever reaches R2, `401` on failure).
+A monotonic `:sequence` CAS (reusing `r2-get-head`/`r2-put-head-if-match`,
+the record JSON-stringified as that pair's "chain" string) rejects rollback
+with `409`, same as `datomic.transact`'s head-race handling but over a
+signed record instead of a commit chain.
+
+**Known lexicon/implementation mismatch** (owner-confirmed, tracked as a
+separate follow-up, not silently papered over): `ipns/head.json`'s query
+param is documented as `graph` ("Graph CID ... IPNS name is derived from
+it"), but no graph-CID→IPNS-name derivation exists anywhere
+(`ipns.core/pubkey->name` derives a name from an Ed25519 **pubkey**, not a
+graph CID). This worker stores/looks up records keyed by the signed
+record's own `:name` field, and the actual query param read is `name`.
+
 ## Architecture
 
 - `handler.cljc` — **pure** XRPC dispatch + `tx_edn`→quads (node-tested with an
