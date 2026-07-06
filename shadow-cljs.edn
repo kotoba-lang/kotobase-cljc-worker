@@ -14,8 +14,8 @@
   "../arrangement/src"
   "../prolly-tree/src"
   "../chain/src"
-  "../ipld/src"
-  "../multiformats/src"
+  "../io-ipld/src"
+  "../io-multiformats/src"
   "../dag-cbor/src"
   ;; byte-exact CACAO verify + canonical-graph
   "../kotobase-client/src"]
