@@ -15,6 +15,7 @@
             [kotobase.cljc-worker.r2 :as r2]
             [kotobase.cacao :as cacao]
             [kotobase.cid :as cid]
+            [kotobase.ipns :as ipns]
             ["@ipld/dag-cbor" :as dag-cbor]
             ["@noble/curves/ed25519.js" :refer [ed25519]]))
 
@@ -194,15 +195,73 @@
                   (-> (delay-ms (min 800 (* 50 attempt)))
                       (.then (fn [_] (run-write bucket pfx method body auth-did (inc attempt)))))))))))
 
+;; ── IPNS head / publish (com.etzhayyim.apps.kotoba.ipns.*, ADR-2607061800) ──
+;;
+;; UNAUTHENTICATED reads, signature-gated writes — a genuinely different trust
+;; model from datomic.transact's CACAO+graph-derivation above, so it is its
+;; own NSID family and its own key-value pair rather than another `case`
+;; branch of `handle`. Reuses r2-get-head/r2-put-head-if-match's CAS pair
+;; (built for the commit-chain string) by JSON-stringifying the whole signed
+;; record as that "chain" string.
+;;
+;; KNOWN LEXICON/IMPLEMENTATION MISMATCH (owner-confirmed, not silently
+;; papered over): ipns/head.json's query param is documented as `graph`
+;; ("Graph CID ... IPNS name is derived from it"), but no graph-CID -> IPNS-
+;; name derivation exists anywhere (`ipns.core/pubkey->name` derives a name
+;; from an Ed25519 PUBKEY, not a graph CID). Storage below is keyed by the
+;; signed record's own `:name` field instead, and the query/response param
+;; actually read here is `name`, not `graph` -- fixing the lexicon itself is
+;; a separate follow-up.
+
+(defn run-ipns-head [^js bucket pfx name]
+  (if (str/blank? (or name ""))
+    (js/Promise.resolve (json-response {:ok false :error "InvalidRequest" :message "missing name"} 400))
+    (-> (r2/r2-get-text bucket (r2/ipns-key pfx name))
+        (.then (fn [text]
+                 (if (nil? text)
+                   (json-response {:ok false :error "NotFound"} 404)
+                   (json-response (js->clj (js/JSON.parse text) :keywordize-keys true) 200)))))))
+
+(defn run-ipns-publish [^js bucket pfx body]
+  (if-not (:valid? (ipns/verify-head body))
+    (js/Promise.resolve (json-response {:ok false :error "InvalidSignature"} 401))
+    (let [name (:name body)]
+      (-> (r2/r2-get-head bucket (r2/ipns-key pfx name))
+          (.then (fn [{:keys [chain etag]}]
+                   (let [current (some-> chain js/JSON.parse (js->clj :keywordize-keys true))]
+                     (if (and current (<= (:sequence body) (:sequence current)))
+                       (json-response {:ok false :error "SequenceRollback"} 409)
+                       (-> (r2/r2-put-head-if-match bucket (r2/ipns-key pfx name)
+                                                    (js/JSON.stringify (clj->js body)) etag)
+                           (.then (fn [ok?]
+                                    (if ok?
+                                      (json-response {:status "ok" :name name} 200)
+                                      (json-response {:ok false :error "ConcurrentWriteConflict"} 409)))))))))))))
+
 ;; ── dispatch ─────────────────────────────────────────────────────────────────
 
 (def ^:private ns-prefix (str "/xrpc/" h/datomic-ns "."))
+(def ^:private ipns-ns-prefix "/xrpc/com.etzhayyim.apps.kotoba.ipns.")
 
 (defn fetch-handler [^js req ^js env]
   (let [url (js/URL. (.-url req))
         path (.-pathname url)]
     (cond
       (= "OPTIONS" (.-method req)) (js/Promise.resolve (cors-preflight))
+
+      (str/starts-with? path ipns-ns-prefix)
+      (let [method (subs path (count ipns-ns-prefix))]
+        (-> (case method
+              "head" (run-ipns-head (.-BUCKET env) (prefix env) (.get (.-searchParams url) "name"))
+              "publish"
+              (-> (.json req)
+                  (.catch (fn [_] #js {}))
+                  (.then (fn [raw] (run-ipns-publish (.-BUCKET env) (prefix env)
+                                                     (js->clj raw :keywordize-keys true)))))
+              (js/Promise.resolve (json-response {:ok false :error "MethodNotImplemented" :method method} 404)))
+            (.catch (fn [^js e]
+                      (json-response {:ok false :error "InternalError" :message (.-message e)} 500)))))
+
       (not (str/starts-with? path ns-prefix))
       (js/Promise.resolve (json-response {:ok false :error "NotFound"} 404))
       :else
