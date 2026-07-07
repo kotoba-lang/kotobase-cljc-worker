@@ -16,7 +16,7 @@
   "../chain/src"
   "../io-ipld/src"
   "../io-multiformats/src"
-  "../dag-cbor/src"
+  "../org-ietf-cbor/src" ; renamed from dag-cbor 2026-07-06
   ;; byte-exact CACAO verify + canonical-graph
   "../kotobase-client/src"]
 
