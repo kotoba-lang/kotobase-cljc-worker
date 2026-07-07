@@ -19,12 +19,28 @@
     { "binding": "BUCKET", "bucket_name": "kotobase-wasm-staging" }
   ],
   "vars": {
-    // NEW prefix — the CLJC prolly/chain block format is incompatible with
-    // the Rust WASM format under kotobase/wasm-staging, so it lives separately
-    // and the old data stays intact for rollback.
-    // v2 = a fresh namespace after the relay-cron bloat was cleared (the cron
-    // firehose-ingested ~3k datoms into the shared yoro-social; disabled + reset).
-    "KOTOBASE_B2_PREFIX": "kotobase/cljc-v2",
+    // v3 (2026-07-07, ADR-2607051000 "Deploy #2" cutover): the ciphertext-
+    // seam adoption (f9454dbf) changed the novelty-tx-block wire shape to
+    // {"ct": ...}, incompatible with v2's plaintext blocks (no back-compat
+    // reader) -- confirmed live, rolled back, then migrated via an offline
+    // snapshot!-based re-transact (kotobase-peer.core/snapshot!, the
+    // documented cold-start/migration entry point), NOT the CACAO-gated
+    // HTTP transact endpoint (that derives the write graph from the
+    // signer, so it can't target an existing DID's graph without that
+    // DID's real key). Parity-diffed byte-for-byte, 0 missing/extra, before
+    // cutover. v2 stays untouched in R2 as rollback.
+    //
+    // Two graphs migrated: the operator's LEGACY "yoro-social" db-name
+    // (2,743 datoms -- superseded 2026-07-03 per YORO_DB_NAME below, but its
+    // data was carried forward for completeness/rollback symmetry) and the
+    // REAL live "yoro-social-v2" (458 datoms -- what YORO_DB_NAME in
+    // app-aozora-appview/pds's wrangler.jsonc actually names, i.e. what the
+    // AppView/PDS read/write). The first cutover attempt targeted only the
+    // legacy name and momentarily served an EMPTY feed in production
+    // (getTimeline/getVideoFeed) until caught and corrected -- always derive
+    // the graph from the db-name a real consumer's wrangler.jsonc names,
+    // never assume "yoro-social" without the "-v2".
+    "KOTOBASE_B2_PREFIX": "kotobase/cljc-v3",
     // empty = accept any validly-signed CACAO (staging); set the operator DID
     // allowlist before the production cutover.
     "KOTOBASE_OPERATOR_DIDS": ""
