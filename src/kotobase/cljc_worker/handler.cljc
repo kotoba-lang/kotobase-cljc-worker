@@ -29,10 +29,31 @@
   in-mem view) speaks — ONE shared datom model across transport, DB, and language
   (ADR-2607032500). Reads the whole string as EDN (no brace-splitting) so map/
   vector values with literal braces are safe (the old tx-edn.mjs brace-split bug).
-  `(str :ns/attr)` keeps the leading ':' — PDS datom consumers key on \":ns/attr\"."
+  `(str :ns/attr)` keeps the leading ':' — PDS datom consumers key on \":ns/attr\".
+
+  Retraction forms (ADR-2607071610 Phase 1) ride the same tx_edn vector:
+  `[:db/retract e a v]` → an :op :retract quad, `[:db/retractEntity e]` →
+  an :op :retract-entity quad — dispatched BEFORE eavt (which is the pure
+  entity-map→[e a v] datafier and stays map-only). Previously these vectors
+  reached eavt and 500'd (実測 2026-07-07: PDS deleteRecord「Doesn't support
+  name:」の根因)."
   [tx-edn]
-  (map (fn [[e a v]] {:s (str e) :p (str a) :o (str v)})
-       (eng/entities->datoms (edn/read-string tx-edn))))
+  (mapcat (fn [item]
+            (cond
+              (and (vector? item) (= 4 (count item)) (= :db/retract (first item)))
+              (let [[_ e a v] item]
+                [{:s (str e) :p (str a) :o (str v) :op :retract}])
+
+              (and (vector? item) (= 2 (count item)) (= :db/retractEntity (first item)))
+              [{:s (str (second item)) :op :retract-entity}]
+
+              (map? item)
+              (map (fn [[e a v]] {:s (str e) :p (str a) :o (str v)})
+                   (eng/entities->datoms [item]))
+
+              :else
+              (throw (ex-info "kotobase: unrecognized tx_edn item" {:item item}))))
+          (edn/read-string tx-edn)))
 
 ;; ── read/write against the graph's persisted chain (ADR-2607032430 D1) ──────
 ;; The chain's head IS the unit of state now (snapshot + pending novelty), not
