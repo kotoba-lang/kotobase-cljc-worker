@@ -113,3 +113,14 @@
 
 (deftest unknown-method
   (is (= "MethodNotImplemented" (:error (h/handle (mem-store) "frobnicate" {} nil)))))
+
+(deftest tx-edn-parses-retraction-forms
+  ;; ADR-2607071610 Phase 1: retract vectors dispatch BEFORE eavt (map-only)
+  (is (= [{:s "post/1" :p ":yoro.post/text" :o "hello" :op :retract}]
+         (h/tx-edn->quads "[[:db/retract \"post/1\" :yoro.post/text \"hello\"]]")))
+  (is (= [{:s "post/1" :op :retract-entity}]
+         (h/tx-edn->quads "[[:db/retractEntity \"post/1\"]]")))
+  (is (= [{:s "e" :p ":a/x" :o "v"}
+          {:s "post/1" :op :retract-entity}]
+         (h/tx-edn->quads "[{:db/id \"e\" :a/x \"v\"} [:db/retractEntity \"post/1\"]]"))
+      "entity maps and retraction forms mix in one tx"))
