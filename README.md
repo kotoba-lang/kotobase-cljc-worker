@@ -105,3 +105,35 @@ shapes it can't answer.
 (no key-range pruning), so a keyed read still fetches every block of that ONE
 index. Range-pruning it to O(path) makes keyed reads touch a handful of blocks —
 the difference between "under the ceiling" (this worker) and "fast".
+
+## Deploy #2 — GATED on the ciphertext-seam migration (ADR-2607051000, confirmed 2026-07-07)
+
+**A SECOND, independent migration gate**, layered on top of the one above
+(that one moved WASM→CLJC; this one moves plaintext→encrypted-seam within
+CLJC). `main` (`f9454dbf`) adopts ADR-2607051000's `blind-fn`/`encrypt-fn`/
+`decrypt-fn` seam (an explicit plaintext-passthrough profile today,
+`kotobase.cljc-worker.crypto` — real per-graph keys are still that ADR's own
+follow-up), which is REQUIRED to even call the current `kotobase-peer` API
+(deploying without it is the "Invalid arity: 4" crash, confirmed live). But
+adopting it also changes the novelty-tx-block wire shape to `{"ct": ...}`
+(`kotobase-peer.core/put-tx-block!`), which has **no backward-compat reader**
+for the plaintext `{"quads": [...]}` blocks the CURRENTLY-DEPLOYED (pre-
+adoption) worker has been writing to `kotobase/cljc-v2` this whole time —
+confirmed live 2026-07-07: deploying `f9454dbf` broke reading real production
+data (`cbor: unexpected end of input`), immediately rolled back.
+
+**Production is deliberately behind git main until this executes** — do not
+redeploy this worker without first:
+
+1. Export the operator `yoro-social` graph's current datoms from the LIVE
+   (pre-adoption) deploy (`datomic.datoms :eavt`, same export mechanism as
+   Deploy #1 above). ~2,743 datoms as of 2026-07-07.
+2. `transact` them into a fresh `KOTOBASE_B2_PREFIX` (e.g. `kotobase/cljc-v3`)
+   via a build of `f9454dbf` (or later) — same repo, same worker code,
+   different prefix, so `kotobase/cljc-v2` stays untouched as rollback.
+3. Parity-diff old vs. new (same `datoms`/`q` check as Deploy #1).
+4. Only then bump `wrangler.jsonc`'s `KOTOBASE_B2_PREFIX` to the new prefix
+   and redeploy to the `kotobase.aozora.app` custom domain.
+
+See ADR-2607051000's "Addendum: adoption attempt + confirmed migration gate
+(2026-07-07)" for the full incident writeup.
