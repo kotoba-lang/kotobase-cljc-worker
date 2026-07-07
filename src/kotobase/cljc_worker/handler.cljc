@@ -15,9 +15,20 @@
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
             [clojure.string :as str]
+            [kotobase.cljc-worker.crypto :as crypto]
             [kotobase-peer.core :as eng]))
 
 (def datomic-ns "ai.gftd.apps.kotobase.datomic")
+
+(defn- then*
+  "Thread `x` through `f` across the engine's platform split (ADR-2607051000:
+  kotobase-peer's crypto-touching fns are synchronous values on JVM but
+  `js/Promise`s on cljs). On cljs every handler response is therefore a
+  Promise — the workerd shell and `r2/with-blocks` both already resolve
+  promises, and `js/Promise.resolve` flattens the non-promise case."
+  [x f]
+  #?(:clj (f x)
+     :cljs (.then (js/Promise.resolve x) f)))
 
 ;; ── tx_edn (vector of entity maps) → engine quads ────────────────────────────
 
@@ -77,15 +88,17 @@
   as `do-q`'s `eng/q` call below) -- this handler has no capability/purpose-
   scoped redaction wired in yet (ADR-2607050500 Phase 3, not done here), so
   it passes `(constantly true)` explicitly: today's behavior is unchanged,
-  stated instead of assumed."
+  stated instead of assumed. `blind-fn`/`decrypt-fn` are the explicit
+  plaintext-passthrough profile (`kotobase.cljc-worker.crypto`,
+  ADR-2607051000 adoption) — on cljs the response is a `js/Promise`."
   [store {:keys [graph index components_edn limit]}]
   (let [chain ((:head-get store) graph)]
-    {:ok true :graph graph
-     :datoms (eng/hot-datoms (:get-fn store) chain
-                             {:index (or (index-kw index) :eavt)
-                              :components (vec components_edn)
-                              :limit limit}
-                             (constantly true))}))
+    (then* (eng/hot-datoms (:get-fn store) chain
+                           {:index (or (index-kw index) :eavt)
+                            :components (vec components_edn)
+                            :limit limit}
+                           (constantly true) crypto/blind-fn crypto/decrypt-fn)
+           (fn [rows] {:ok true :graph graph :datoms (vec rows)}))))
 
 (defn do-transact
   "`datomic.transact` — append the tx quads as ONE novelty block and advance
@@ -99,12 +112,13 @@
   [store {:keys [graph tx_edn]} _auth-did]
   (let [get-fn (:get-fn store)
         prev-chain ((:head-get store) graph)
-        quads (tx-edn->quads tx_edn)
-        chain (eng/commit! (:put! store) get-fn quads prev-chain)]
-    ((:head-put! store) graph chain)
-    {:ok true :graph graph :commit chain
-     :datom_count (count quads)
-     :novelty_size (eng/novelty-size get-fn chain)}))
+        quads (tx-edn->quads tx_edn)]
+    (then* (eng/commit! (:put! store) get-fn quads prev-chain crypto/encrypt-fn)
+           (fn [chain]
+             ((:head-put! store) graph chain)
+             {:ok true :graph graph :commit chain
+              :datom_count (count quads)
+              :novelty_size (eng/novelty-size get-fn chain)}))))
 
 (defn- hot-db
   "The full hot db as of `chain` (snapshot + novelty merged) — for `do-q`,
@@ -117,9 +131,12 @@
   `do-q`'s own `eng/q` call, below, for why: no capability/purpose-scoped
   redaction is wired into this handler yet, ADR-2607050500 Phase 3)."
   [get-fn chain]
-  (eng/transact (eng/empty-db)
-                (map (fn [{:keys [e a v_edn]}] {:s e :p a :o (edn/read-string v_edn)})
-                     (eng/hot-datoms get-fn chain (constantly true)))))
+  (then* (eng/hot-datoms get-fn chain (constantly true)
+                         crypto/blind-fn crypto/decrypt-fn)
+         (fn [rows]
+           (eng/transact (eng/empty-db)
+                         (map (fn [{:keys [e a v_edn]}] {:s e :p a :o (edn/read-string v_edn)})
+                              rows)))))
 
 (defn do-q
   "`datomic.q` — triple-pattern query. Rebuilds a hot db from snapshot+novelty
@@ -135,9 +152,9 @@
   matching quad visible), stated instead of assumed."
   [store {:keys [graph query_edn]}]
   (let [chain ((:head-get store) graph)
-        db    (hot-db (:get-fn store) chain)
         pat   (edn/read-string query_edn)]
-    {:ok true :graph graph :rows (vec (eng/q db pat (constantly true)))}))
+    (then* (hot-db (:get-fn store) chain)
+           (fn [db] {:ok true :graph graph :rows (vec (eng/q db pat (constantly true)))}))))
 
 (defn do-pull
   "`datomic.pull` — all attrs of one entity, via hot-datoms (snapshot +
@@ -146,11 +163,12 @@
   Same `(constantly true)` `visible?` convention as `do-datoms`/`hot-db`,
   above (ADR-2607050500 Phase 3 redaction not wired in yet)."
   [store {:keys [graph entity]}]
-  (let [chain ((:head-get store) graph)
-        rows  (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
-                              (constantly true))]
-    {:ok true :graph graph :entity entity
-     :attrs (reduce (fn [m {:keys [a v_edn]}] (update m a (fnil conj []) v_edn)) {} rows)}))
+  (let [chain ((:head-get store) graph)]
+    (then* (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
+                           (constantly true) crypto/blind-fn crypto/decrypt-fn)
+           (fn [rows]
+             {:ok true :graph graph :entity entity
+              :attrs (reduce (fn [m {:keys [a v_edn]}] (update m a (fnil conj []) v_edn)) {} rows)}))))
 
 (defn do-fold
   "`datomic.fold` — compacts a graph's accumulated novelty into a fresh
@@ -168,9 +186,11 @@
         novelty-n (if chain (eng/novelty-size get-fn chain) 0)]
     (if (zero? novelty-n)
       {:ok true :graph graph :folded false}
-      (let [new-chain (eng/fold! (:put! store) get-fn chain)]
-        ((:head-put! store) graph new-chain)
-        {:ok true :graph graph :folded true :commit new-chain :novelty_folded novelty-n}))))
+      (then* (eng/fold! (:put! store) get-fn chain
+                        crypto/blind-fn crypto/encrypt-fn crypto/decrypt-fn)
+             (fn [new-chain]
+               ((:head-put! store) graph new-chain)
+               {:ok true :graph graph :folded true :commit new-chain :novelty_folded novelty-n})))))
 
 ;; ── dispatch ─────────────────────────────────────────────────────────────────
 
@@ -180,18 +200,28 @@
   `auth-did` is the CACAO-verified issuer or nil. Returns a plain response map;
   never throws for a known method (errors become `{:ok false :error …}`)."
   [store method body auth-did]
-  (try
-    (case method
-      "datoms"   (do-datoms store body)
-      "transact" (do-transact store body auth-did)
-      "q"        (do-q store body)
-      "pull"     (do-pull store body)
-      "fold"     (do-fold store body)
-      {:ok false :error "MethodNotImplemented" :method method})
-    (catch #?(:clj Exception :cljs :default) e
-      ;; the R2 trampoline's cache-miss must propagate to with-blocks, NOT be
-      ;; swallowed here — re-throw it; only real errors become InternalError.
-      (if (:block-miss (ex-data e))
-        (throw e)
-        {:ok false :error "InternalError"
-         :message #?(:clj (.getMessage e) :cljs (.-message e))}))))
+  (letfn [(err [e]
+            ;; the R2 trampoline's cache-miss must propagate to with-blocks,
+            ;; NOT be swallowed here — re-throw it (on cljs: rejecting the
+            ;; response promise, which with-blocks' .catch trampolines); only
+            ;; real errors become InternalError.
+            (if (:block-miss (ex-data e))
+              (throw e)
+              {:ok false :error "InternalError"
+               :message #?(:clj (.getMessage ^Exception e)
+                           :cljs (or (ex-message e) (.-message e)))}))]
+    (try
+      (let [resp (case method
+                   "datoms"   (do-datoms store body)
+                   "transact" (do-transact store body auth-did)
+                   "q"        (do-q store body)
+                   "pull"     (do-pull store body)
+                   "fold"     (do-fold store body)
+                   {:ok false :error "MethodNotImplemented" :method method})]
+        ;; ADR-2607051000: on cljs the do-* fns return js/Promises (the
+        ;; engine's crypto seam is Promise-based there) — async failures
+        ;; surface as rejections, which the sync try/catch can't see.
+        #?(:clj resp
+           :cljs (.catch (js/Promise.resolve resp) err)))
+      (catch #?(:clj Exception :cljs :default) e
+        (err e)))))

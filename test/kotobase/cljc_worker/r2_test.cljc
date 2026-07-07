@@ -1,12 +1,16 @@
 (ns kotobase.cljc-worker.r2-test
   (:require [cljs.test :refer [deftest is testing async]]
+            [kotobase.cljc-worker.crypto :as crypto]
             [kotobase.cljc-worker.r2 :as r2]
             [kotobase-peer.core :as eng]))
 
-(deftest with-blocks-bridges-async-r2-to-sync-cold-datoms
+(deftest with-blocks-bridges-async-r2-to-async-cold-datoms
   ;; Persist a snapshot into an in-memory block map, then serve those blocks
-  ;; ASYNC (promise per fetch) through the trampoline and run the SYNC
-  ;; cold-datoms against it — it must equal a direct sync read.
+  ;; ASYNC (promise per fetch) through the trampoline and run cold-datoms
+  ;; (itself a Promise on cljs since the ADR-2607051000 crypto seam — the
+  ;; trampoline retries block-miss REJECTIONS, not just sync throws) against
+  ;; it — it must equal a direct read. Crypto fns are the worker's explicit
+  ;; plaintext-passthrough profile.
   (async done
     (let [blocks (atom {})
           put! (fn [cid b] (swap! blocks assoc cid b))
@@ -15,27 +19,32 @@
                            [["keybackup/zA" ":aozora.keyBackup/did" "did:key:zA"]
                             ["keybackup/zA" ":aozora.keyBackup/blob" "blobA"]
                             ["keybackup/zB" ":aozora.keyBackup/did" "did:key:zB"]])
-          chain (eng/snapshot! put! sync-get db nil)
-          snap  (eng/latest-snapshot-cid sync-get chain)
           ;; async R2 fetch: resolve the block on a microtask
           fetch1 (fn [cid] (js/Promise.resolve (get @blocks cid)))
-          everything (constantly true)
-          direct (eng/cold-datoms sync-get snap
-                                  {:index :eavt :components ["keybackup/zA"]} everything)]
-      (-> (r2/with-blocks fetch1
-            (fn [g] (eng/cold-datoms g snap {:index :eavt :components ["keybackup/zA"]} everything)))
-          (.then (fn [via-r2]
-                   (is (= (set direct) (set via-r2)) "async-R2 read == sync read")
-                   (is (= 2 (count via-r2)))
-                   ;; a point lookup via the trampoline too
-                   (r2/with-blocks fetch1
-                     (fn [g] (eng/cold-datoms g snap
-                                              {:index :avet
-                                               :components [":aozora.keyBackup/did" "did:key:zB"]}
-                                              everything)))))
+          everything (constantly true)]
+      (-> (eng/snapshot! put! sync-get db nil crypto/blind-fn crypto/encrypt-fn)
+          (.then (fn [chain]
+                   (let [snap (eng/latest-snapshot-cid sync-get chain)]
+                     (-> (eng/cold-datoms sync-get snap
+                                          {:index :eavt :components ["keybackup/zA"]}
+                                          everything crypto/blind-fn crypto/decrypt-fn)
+                         (.then (fn [direct]
+                                  (-> (r2/with-blocks fetch1
+                                        (fn [g] (eng/cold-datoms g snap
+                                                                 {:index :eavt :components ["keybackup/zA"]}
+                                                                 everything crypto/blind-fn crypto/decrypt-fn)))
+                                      (.then (fn [via-r2]
+                                               (is (= (set direct) (set via-r2)) "async-R2 read == direct read")
+                                               (is (= 2 (count via-r2)))
+                                               ;; a point lookup via the trampoline too
+                                               (r2/with-blocks fetch1
+                                                 (fn [g] (eng/cold-datoms g snap
+                                                                          {:index :avet
+                                                                           :components [":aozora.keyBackup/did" "did:key:zB"]}
+                                                                          everything crypto/blind-fn crypto/decrypt-fn))))))))))))
           (.then (fn [rows]
                    (is (= [{:e "keybackup/zB" :a ":aozora.keyBackup/did"
-                            :v_edn "\"did:key:zB\"" :added true}] rows))
+                            :v_edn "\"did:key:zB\"" :added true}] (vec rows)))
                    (done)))
           (.catch (fn [e] (is false (str "trampoline threw: " e)) (done)))))))
 

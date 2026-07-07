@@ -25,26 +25,31 @@
 (defn with-blocks
   "Run `(f sync-get)` where `sync-get` reads from an in-memory cache, fetching
   absent blocks via `(fetch1 cid) -> Promise<bytes>` and retrying. Returns a
-  Promise of `f`'s result. `f` must be pure/idempotent (it is re-run per miss)."
+  Promise of `f`'s result. `f` must be pure/idempotent (it is re-run per miss).
+
+  `f` may return a plain value OR a js/Promise (ADR-2607051000: the engine's
+  crypto seam made the handler's reads/writes Promise-returning on cljs) — a
+  block-miss can therefore surface either as a SYNC throw from `f` or as a
+  REJECTION of `f`'s promise (sync-get called inside a .then continuation),
+  and both trampoline the same way. Non-miss failures reject through."
   [fetch1 f]
   (let [cache (atom {})
         sync-get (fn [cid]
                    (if (contains? @cache cid)
                      (get @cache cid)
                      (throw (missing-block cid))))]
-    (letfn [(step []
-              (let [outcome (try {:done (f sync-get)}
-                                 (catch :default e
-                                   (if (:block-miss (ex-data e))
-                                     {:miss (:cid (ex-data e))}
-                                     {:error e})))]
-                (cond
-                  (contains? outcome :done)  (js/Promise.resolve (:done outcome))
-                  (contains? outcome :error) (js/Promise.reject (:error outcome))
-                  :else (-> (fetch1 (:miss outcome))
-                            (.then (fn [bytes]
-                                     (swap! cache assoc (:miss outcome) bytes)
-                                     (step)))))))]
+    (letfn [(fetch-and-retry [e]
+              (if (:block-miss (ex-data e))
+                (-> (fetch1 (:cid (ex-data e)))
+                    (.then (fn [bytes]
+                             (swap! cache assoc (:cid (ex-data e)) bytes)
+                             (step))))
+                (js/Promise.reject e)))
+            (step []
+              (try
+                (-> (js/Promise.resolve (f sync-get))
+                    (.catch fetch-and-retry))
+                (catch :default e (fetch-and-retry e))))]
       (step))))
 
 ;; ── R2 binding wrappers (workerd) ────────────────────────────────────────────
