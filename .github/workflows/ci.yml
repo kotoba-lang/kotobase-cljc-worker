@@ -21,7 +21,7 @@ jobs:
       - run: git clone --depth 1 https://github.com/kotoba-lang/chain.git ../chain
       - run: git clone --depth 1 https://github.com/kotoba-lang/io-ipld.git ../io-ipld
       - run: git clone --depth 1 https://github.com/kotoba-lang/io-multiformats.git ../io-multiformats
-      - run: git clone --depth 1 https://github.com/kotoba-lang/dag-cbor.git ../dag-cbor
+      - run: git clone --depth 1 https://github.com/kotoba-lang/org-ietf-cbor.git ../org-ietf-cbor
       - run: git clone --depth 1 https://github.com/kotoba-lang/kotobase-client.git ../kotobase-client
       - uses: actions/setup-java@v4
         with:
