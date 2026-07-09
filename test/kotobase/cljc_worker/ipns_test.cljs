@@ -85,3 +85,30 @@
       (-> (w/run-ipns-publish bucket "" (signed-record {:name "k51advance" :sequence 1}))
           (.then (fn [_] (w/run-ipns-publish bucket "" (signed-record {:name "k51advance" :sequence 2}))))
           (.then (fn [^js resp] (is (= 200 (.-status resp))) (done)))))))
+
+(deftest publish-rejects-a-non-numeric-sequence
+  (testing "a validly-signed record with a non-numeric :sequence (e.g. a
+            string) must NOT reach the <= rollback comparison -- under
+            cljs, a non-numeric operand coerces to NaN, and NaN <= anything
+            is false, so a naive comparison would silently let this
+            through as 'not a rollback' instead of rejecting it"
+    (async done
+      (let [bucket (make-fake-bucket)]
+        (-> (w/run-ipns-publish bucket "" (signed-record {:name "k51nan1" :sequence "abc"}))
+            (.then (fn [^js resp]
+                     (is (= 400 (.-status resp)))
+                     (response->clj resp)))
+            (.then (fn [body] (is (= "InvalidSequence" (:error body))) (done))))))))
+
+(deftest publish-rejects-a-non-numeric-sequence-even-against-a-much-higher-current
+  (testing "the exploit shape: current is at a much higher sequence, so a
+            naive NaN <= 999 comparison would have read as 'not a
+            rollback' and silently accepted the malformed record"
+    (async done
+      (let [bucket (make-fake-bucket)]
+        (-> (w/run-ipns-publish bucket "" (signed-record {:name "k51nan2" :sequence 999}))
+            (.then (fn [_] (w/run-ipns-publish bucket "" (signed-record {:name "k51nan2" :sequence "abc"}))))
+            (.then (fn [^js resp]
+                     (is (= 400 (.-status resp)))
+                     (response->clj resp)))
+            (.then (fn [body] (is (= "InvalidSequence" (:error body))) (done))))))))

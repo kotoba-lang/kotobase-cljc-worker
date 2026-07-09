@@ -213,6 +213,15 @@
 ;; actually read here is `name`, not `graph` -- fixing the lexicon itself is
 ;; a separate follow-up.
 
+(defn- valid-sequence?
+  "A `:sequence` value the rollback comparison below can safely `<=`.
+  `(= x x)` is false for NaN (IEEE-754 self-inequality) -- needed because a
+  non-numeric `:sequence` (e.g. a string) coerces to NaN under cljs's loose
+  `<=`, and NaN compares false against everything, which would silently
+  disable the rollback guard rather than rejecting the write."
+  [x]
+  (and (number? x) (= x x)))
+
 (defn run-ipns-head [^js bucket pfx name]
   (if (str/blank? (or name ""))
     (js/Promise.resolve (json-response {:ok false :error "InvalidRequest" :message "missing name"} 400))
@@ -223,14 +232,26 @@
                    (json-response (js->clj (js/JSON.parse text) :keywordize-keys true) 200)))))))
 
 (defn run-ipns-publish [^js bucket pfx body]
-  (if-not (:valid? (ipns/verify-head body))
+  (cond
+    (not (:valid? (ipns/verify-head body)))
     (js/Promise.resolve (json-response {:ok false :error "InvalidSignature"} 401))
+
+    (not (valid-sequence? (:sequence body)))
+    (js/Promise.resolve (json-response {:ok false :error "InvalidSequence"} 400))
+
+    :else
     (let [name (:name body)]
       (-> (r2/r2-get-head bucket (r2/ipns-key pfx name))
           (.then (fn [{:keys [chain etag]}]
                    (let [current (some-> chain js/JSON.parse (js->clj :keywordize-keys true))]
-                     (if (and current (<= (:sequence body) (:sequence current)))
+                     (cond
+                       (and current (not (valid-sequence? (:sequence current))))
+                       (json-response {:ok false :error "InvalidSequence"} 400)
+
+                       (and current (<= (:sequence body) (:sequence current)))
                        (json-response {:ok false :error "SequenceRollback"} 409)
+
+                       :else
                        (-> (r2/r2-put-head-if-match bucket (r2/ipns-key pfx name)
                                                     (js/JSON.stringify (clj->js body)) etag)
                            (.then (fn [ok?]
