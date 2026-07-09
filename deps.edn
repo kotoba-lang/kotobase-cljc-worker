@@ -1,1 +1,7 @@
-{:paths ["src"] :deps {}}
+{:paths ["src"]
+ :deps {}
+ :aliases
+ {;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
+  :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
+         :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"
+                     "--fail-level" "error"]}}}

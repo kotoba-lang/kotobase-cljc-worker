@@ -45,3 +45,13 @@ jobs:
 
       - run: npm install
       - run: npm test
+
+  lint:
+    name: clj-kondo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+      - run: clojure -M:lint
