@@ -50,6 +50,26 @@
            (.catch (fn [e] (is false (str "rejected: " e)) (done)))))))
 
 #?(:cljs
+   (deftest handle-returns-a-clean-error-not-a-broken-promise-on-malformed-tx-edn
+     ;; do-transact's tx-edn->quads calls edn/read-string on the caller-
+     ;; supplied tx_edn -- a malformed string throws SYNCHRONOUSLY, before
+     ;; do-transact ever returns a value/Promise, which used to skip
+     ;; `handle`'s `.catch (js/Promise.resolve resp) ...` wrapping and hit
+     ;; its outer `(catch ... (err e))` bare -- returning a PLAIN map
+     ;; instead of the Promise every cljs caller's `.then` assumes `handle`
+     ;; always returns (a raw `TypeError: ...handle(...).then is not a
+     ;; function`, not a clean rejection, on the live production write
+     ;; path). If `handle` regresses to that bare form, `.then` below
+     ;; throws synchronously and this test fails loudly, not silently.
+     (async done
+       (-> (h/handle (mem-store) "transact" {:graph g :tx_edn "not valid edn ["} "did:web:x")
+           (.then (fn [r]
+                    (is (not (:ok r)))
+                    (is (= "InternalError" (:error r)))
+                    (done)))
+           (.catch (fn [e] (is false (str "rejected: " e)) (done)))))))
+
+#?(:cljs
    (deftest fold-on-empty-or-already-folded-graph-is-a-safe-no-op
      (async done
        (let [store (mem-store)]

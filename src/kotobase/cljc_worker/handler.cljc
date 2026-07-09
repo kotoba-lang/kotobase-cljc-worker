@@ -224,4 +224,16 @@
         #?(:clj resp
            :cljs (.catch (js/Promise.resolve resp) err)))
       (catch #?(:clj Exception :cljs :default) e
-        (err e)))))
+        ;; A do-* fn that throws SYNCHRONOUSLY (before ever returning a
+        ;; value/Promise -- e.g. do-transact's tx-edn->quads or do-q's
+        ;; pattern parse, both `edn/read-string` on externally-supplied
+        ;; EDN) skips the `case` result entirely and lands here,
+        ;; bypassing the `.catch (js/Promise.resolve resp) ...` wrapping
+        ;; above. Without this being Promise-wrapped too, `handle` would
+        ;; return a PLAIN map on this path instead of the Promise every
+        ;; cljs caller's `.then` assumes `handle` always returns --
+        ;; `TypeError: ...handle(...).then is not a function`, not a
+        ;; clean error, on the live production write path (a malformed
+        ;; tx_edn from any caller).
+        #?(:clj (err e)
+           :cljs (js/Promise.resolve (err e)))))))
