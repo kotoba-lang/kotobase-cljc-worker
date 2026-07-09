@@ -21,6 +21,23 @@
 
 ;; ── CACAO verify (byte-exact port of aozora.pds.auth/verify-cacao) ──────────
 
+(defn- expired?
+  "true iff `exp` (an ISO date string, or nil/absent -- no expiry check in
+  that case, per this fn's own existing 'expiry-if-present' scope) denotes
+  a time at or before now. `js/Date.parse` returns NaN (not nil, not a
+  throw) on an unparseable string, and NaN < anything is FALSE in JS -- so
+  a naive `(< (js/Date.parse exp) now)` treats a malformed :exp as
+  'never expired', permanently valid. A malformed-but-present :exp is
+  therefore treated as expired here (fail closed), matching the already-
+  fixed sibling implementations (net-kotobase's kotobase-cf-wasm.auth/
+  parse-epoch-sec and clj-edge's kotobase.edge-cacao/parse-utc-seconds,
+  both js/Number.isFinite-gated for the same reason)."
+  [exp]
+  (and exp
+       (let [parsed (js/Date.parse exp)]
+         (or (not (js/Number.isFinite parsed))
+             (< parsed (.getTime (js/Date.)))))))
+
 (defn verify-cacao
   "→ issuer DID (string) | nil. Decodes the CACAO, recomputes its SIWE message,
   and Ed25519-verifies under the issuer's did:key. Same source the PDS mints/
@@ -32,7 +49,7 @@
           iss (.-iss p)
           pub (cid/did-key->ed25519-pub iss)
           exp (.-exp p)
-          expired? (and exp (< (js/Date.parse exp) (.getTime (js/Date.))))
+          expired? (expired? exp)
           p-clj {:domain (.-domain p) :iss iss :aud (.-aud p) :version (.-version p)
                  :nonce (.-nonce p) :iat (.-iat p) :exp exp :statement (.-statement p)
                  :resources (vec (.-resources p))}
