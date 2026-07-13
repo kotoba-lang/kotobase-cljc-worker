@@ -15,6 +15,15 @@
   "routes": [
     { "pattern": "kotobase.aozora.app", "custom_domain": true }
   ],
+  // Raised from the (unset) plan default so a one-time catch-up `fold` can
+  // synchronously decode/merge yoro-social-v2's mass-write novelty backlog
+  // (ADR-2607110200 addendum, 2026-07-10: reads AND folds were hitting
+  // Cloudflare error 1102, CPU time exceeded, well before any I/O-bound
+  // R2 concurrency limit) -- 300000ms is the documented max for the
+  // Workers Standard usage model; once the backlog is folded into a fresh
+  // cold snapshot, steady-state reads/folds go back to being cheap and
+  // this ceiling stops mattering in practice.
+  "limits": { "cpu_ms": 300000 },
   "r2_buckets": [
     { "binding": "BUCKET", "bucket_name": "kotobase-wasm-staging" }
   ],

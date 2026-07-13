@@ -16,7 +16,8 @@
                :cljs [cljs.reader :as edn])
             [clojure.string :as str]
             [kotobase.cljc-worker.crypto :as crypto]
-            [kotobase-peer.core :as eng]))
+            [kotobase-peer.core :as eng]
+            [ipld.core :as ipld]))
 
 (def datomic-ns "ai.gftd.apps.kotobase.datomic")
 
@@ -179,18 +180,31 @@
   call is cheap and doesn't perturb the head. Safe to call anytime, including
   concurrently with a transact or with another fold of the same graph — fold!
   is deterministic/content-addressed, so races converge rather than corrupt
-  (the CAS layer in the worker shell resolves any actual head contention)."
-  [store {:keys [graph]}]
+  (the CAS layer in the worker shell resolves any actual head contention).
+
+  Optional body `:max_novelty` (a positive int) bounds the fold to the
+  OLDEST that-many not-yet-folded tx blocks (kotobase-peer#16's
+  `fold!`/`take-oldest-novelty`) instead of the unbounded default —
+  gftdcojp/app-aozora#78: a backlog large enough that even one bounded-
+  concurrency fold pass exceeds one Worker invocation's CPU/wall-time
+  budget can leave an unbounded fold unable to ever complete. A cron/ops
+  caller can pass a small `:max_novelty` and call repeatedly to make
+  guaranteed forward progress against such a backlog. Omitted/nil is
+  unbounded — identical to pre-existing behavior."
+  [store {:keys [graph max_novelty]}]
   (let [get-fn (:get-fn store)
         chain ((:head-get store) graph)
-        novelty-n (if chain (eng/novelty-size get-fn chain) 0)]
+        novelty-n (if chain (eng/novelty-size get-fn chain) 0)
+        max-novelty (when (pos-int? max_novelty) max_novelty)]
     (if (zero? novelty-n)
       {:ok true :graph graph :folded false}
-      (then* (eng/fold! (:put! store) get-fn chain
+      (then* (eng/fold! (:put! store) get-fn chain ipld/link? max-novelty
                         crypto/blind-fn crypto/encrypt-fn crypto/decrypt-fn)
              (fn [new-chain]
                ((:head-put! store) graph new-chain)
-               {:ok true :graph graph :folded true :commit new-chain :novelty_folded novelty-n})))))
+               {:ok true :graph graph :folded true :commit new-chain
+                :novelty_folded (if max-novelty (min max-novelty novelty-n) novelty-n)
+                :novelty_remaining (if max-novelty (max 0 (- novelty-n max-novelty)) 0)})))))
 
 ;; ── dispatch ─────────────────────────────────────────────────────────────────
 
