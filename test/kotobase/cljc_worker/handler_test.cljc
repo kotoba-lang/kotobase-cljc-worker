@@ -82,6 +82,45 @@
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
 
 #?(:cljs
+   (deftest bounded-fold-drains-a-backlog-across-repeated-calls
+     ;; gftdcojp/app-aozora#78 / kotobase-peer#16: a cron/ops caller can pass
+     ;; :max_novelty to make guaranteed forward progress against a backlog
+     ;; too large to fold in one unbounded pass -- each call folds only the
+     ;; OLDEST max_novelty tx blocks, leaving the rest as novelty, and repeated
+     ;; calls converge to the same fully-folded state an unbounded fold would
+     ;; reach in one call.
+     (async done
+       (let [store (mem-store)
+             tx (fn [n] (str "[{:db/id \"e" n "\" :ns/attr \"v" n "\"}]"))]
+         (-> (h/handle store "transact" {:graph g :tx_edn (tx 1)} "did:web:x")
+             (.then (fn [_] (h/handle store "transact" {:graph g :tx_edn (tx 2)} "did:web:x")))
+             (.then (fn [_] (h/handle store "transact" {:graph g :tx_edn (tx 3)} "did:web:x")))
+             (.then (fn [_] (h/do-datoms store {:graph g})))
+             (.then (fn [before]
+                      (-> (h/handle store "fold" {:graph g :max_novelty 2} "did:web:x")
+                          (.then (fn [f1]
+                                   (testing "first bounded call folds only the oldest 2, leaves 1"
+                                     (is (:ok f1))
+                                     (is (true? (:folded f1)))
+                                     (is (= 2 (:novelty_folded f1)))
+                                     (is (= 1 (:novelty_remaining f1)))
+                                     (is (= 1 (eng/novelty-size (:get-fn store) (:commit f1)))))
+                                   (h/handle store "fold" {:graph g :max_novelty 2} "did:web:x")))
+                          (.then (fn [f2]
+                                   (testing "second bounded call folds the remaining 1 (fewer than the cap)"
+                                     (is (:ok f2))
+                                     (is (true? (:folded f2)))
+                                     (is (= 1 (:novelty_folded f2)))
+                                     (is (= 0 (:novelty_remaining f2)))
+                                     (is (zero? (eng/novelty-size (:get-fn store) (:commit f2)))))
+                                   (h/do-datoms store {:graph g})))
+                          (.then (fn [after]
+                                   (is (= (set (:datoms before)) (set (:datoms after)))
+                                       "bounded folds across multiple calls lose nothing")
+                                   (done))))))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
    (deftest transact-then-filtered-read-roundtrip
      ;; ADR-2607032430 D1: transact never hydrates/rebuilds -- it only appends a
      ;; novelty tx block -- yet every read (datoms/pull/q) must still see that
