@@ -183,7 +183,27 @@
                                                         (sync-get cid)))
                                    :put! (fn [cid bytes] (swap! buffer assoc cid bytes))
                                    :head-get (constantly chain)
-                                   :head-put! (fn [_ _] nil)}   ; head CAS'd below
+                                   :head-put! (fn [_ _] nil)   ; head CAS'd below
+                                   ;; ADR-2607120730 Part 1: DIRECT (unbuffered)
+                                   ;; R2 read/write, NOT threaded through
+                                   ;; `buffer` -- do-fold's cache-put! must
+                                   ;; land immediately so an attempt that
+                                   ;; hydrates OK but exceeds its CPU budget
+                                   ;; later still leaves the cache populated
+                                   ;; for the next retry (a write buffered
+                                   ;; here would only flush AFTER the whole
+                                   ;; response returns, i.e. never, on
+                                   ;; exactly that failure). do-transact never
+                                   ;; reads these keys, so providing them
+                                   ;; unconditionally for every method is
+                                   ;; harmless. Plain text put/get (R2
+                                   ;; accepts a string body directly, same as
+                                   ;; r2-put-head-if-match's head write) --
+                                   ;; hydrate-db-cached's cache values are
+                                   ;; already pr-str'd EDN strings, no byte
+                                   ;; encoding needed.
+                                   :cache-get (fn [k] (r2/r2-get-text bucket (str pfx k)))
+                                   :cache-put! (fn [k v] (.put bucket (str pfx k) v))}
                                   method body auth-did)))
                      (.then (fn [resp] (flush-blocks-and-cas-head! bucket pfx graph etag resp buffer)))))))))
 

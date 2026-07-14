@@ -12,30 +12,36 @@
   mem-store fixture shares ONE atom between :get-fn and :put!, so it never
   exercises this at all — only a genuinely async store (a real R2 bucket,
   or this fake one) does."
-  (:require [cljs.test :refer [deftest is testing async]]
+  (:require [clojure.string :as str]
+            [cljs.test :refer [deftest is testing async]]
             [kotobase.cljc-worker.worker :as w]))
 
 ;; Same fidelity contract as r2-test's make-fake-bucket (this repo's own
 ;; precedent for mocking R2 without a live Cloudflare binding): async
 ;; .get/.put, minted etags, unconditional put on a nil onlyIf.
-(defn- make-fake-bucket []
-  (let [store (atom {})
-        etag-seq (atom 0)]
-    #js {:get (fn [k]
-                (js/Promise.resolve
-                 (when-let [{:keys [value etag]} (get @store k)]
-                   #js {:text (fn [] (js/Promise.resolve value))
-                        :arrayBuffer (fn [] (js/Promise.resolve (js/Uint8Array.from value)))
-                        :etag etag})))
-         :put (fn [k v ^js opts]
-                (js/Promise.resolve
-                 (let [required (some-> opts .-onlyIf .-etagMatches)]
-                   (if (and (some? required)
-                            (not= required (:etag (get @store k))))
-                     nil
-                     (let [new-etag (str "etag-" (swap! etag-seq inc))]
-                       (swap! store assoc k {:value v :etag new-etag})
-                       #js {:etag new-etag})))))}))
+;;
+;; Optional `store` arg (default: a fresh atom) lets a caller keep a
+;; reference to the underlying key/value map to inspect after a call --
+;; existing 0-arg call sites are unaffected.
+(defn- make-fake-bucket
+  ([] (make-fake-bucket (atom {})))
+  ([store]
+   (let [etag-seq (atom 0)]
+     #js {:get (fn [k]
+                 (js/Promise.resolve
+                  (when-let [{:keys [value etag]} (get @store k)]
+                    #js {:text (fn [] (js/Promise.resolve value))
+                         :arrayBuffer (fn [] (js/Promise.resolve (js/Uint8Array.from value)))
+                         :etag etag})))
+          :put (fn [k v ^js opts]
+                 (js/Promise.resolve
+                  (let [required (some-> opts .-onlyIf .-etagMatches)]
+                    (if (and (some? required)
+                             (not= required (:etag (get @store k))))
+                      nil
+                      (let [new-etag (str "etag-" (swap! etag-seq inc))]
+                        (swap! store assoc k {:value v :etag new-etag})
+                        #js {:etag new-etag})))))})))
 
 (deftest genesis-transact-against-a-real-async-bucket-succeeds
   (async done
@@ -61,5 +67,29 @@
                    (testing "do-fold reading back its own fold!-written blocks must not crash either"
                      (is (:ok resp) (str "resp: " (pr-str resp)))
                      (is (:folded resp)))
+                   (done)))
+          (.catch (fn [e] (is false (str "unexpected rejection: " (.-message e))) (done)))))))
+
+(deftest fold-against-a-real-async-bucket-populates-the-memoized-hydration-cache
+  ;; ADR-2607120730 Part 1: proves the R2 adapter (:cache-get/:cache-put! in
+  ;; run-write-attempt's store -- kotobase.cljc-worker.r2/r2-get-text plus a
+  ;; direct .put, NOT threaded through the buffered end-of-request flush) is
+  ;; wired correctly end-to-end through the REAL run-write/do-fold path, not
+  ;; just at the pure-handler layer (handler_test.cljc) or the engine layer
+  ;; (kotobase-peer's own cache-hit-skips-decrypt tests).
+  (async done
+    (let [store (atom {})
+          bucket (make-fake-bucket store)
+          pfx "kotobase/cljc-v3/"
+          tx (fn [n] (str "[{:db/id \"e" n "\" :yoro.post/uri \"at://a/p" n "\"}]"))]
+      (-> (w/run-write bucket pfx "transact" {:graph "g4" :tx_edn (tx 1)} nil)
+          (.then (fn [_] (w/run-write bucket pfx "fold" {:graph "g4"} nil))) ; warm-up: first indexed snapshot
+          (.then (fn [_] (w/run-write bucket pfx "transact" {:graph "g4" :tx_edn (tx 2)} nil)))
+          (.then (fn [_] (w/run-write bucket pfx "fold" {:graph "g4"} nil))) ; the fold under test
+          (.then (fn [resp]
+                   (is (:ok resp) (str "resp: " (pr-str resp)))
+                   (is (:folded resp))
+                   (is (some #(str/starts-with? % (str pfx "hydrate-cache/v1/")) (keys @store))
+                       "cache-put! actually wrote a hydrate-cache entry to the bucket, under the configured prefix")
                    (done)))
           (.catch (fn [e] (is false (str "unexpected rejection: " (.-message e))) (done)))))))

@@ -121,6 +121,44 @@
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
 
 #?(:cljs
+   (deftest do-fold-cache-get-cache-put-are-threaded-through-and-populate-the-cache
+     ;; ADR-2607120730 Part 1: do-fold passes (:cache-get store)/(:cache-put!
+     ;; store) through to eng/fold!'s memoized-hydration arity. This proves
+     ;; the WIRING (store -> do-fold -> eng/fold!) is correct -- the
+     ;; underlying cache-hit-skips-decrypt behavior itself is kotobase-peer's
+     ;; own test suite's job (fold-bang-cache-get-cache-put-avoids-
+     ;; rehydrating-...), not re-proven here.
+     ;;
+     ;; `store`'s :head-put! is a no-op (base's is real) so two `do-fold`
+     ;; calls against `store` both retry the SAME starting chain -- exactly
+     ;; the production scenario (a cron tick that keeps failing later never
+     ;; actually advances the head, so every retry re-reads the identical
+     ;; still-unfolded snapshot).
+     (async done
+       (let [cache (atom {})
+             base (mem-store)
+             store (assoc base
+                          :cache-get (fn [k] (js/Promise.resolve (get @cache k)))
+                          :cache-put! (fn [k v] (js/Promise.resolve (swap! cache assoc k v)))
+                          :head-put! (fn [_ _] nil))
+             tx (fn [n] (str "[{:db/id \"e" n "\" :ns/attr \"v" n "\"}]"))]
+         (-> (h/handle base "transact" {:graph g :tx_edn (tx 1)} "did:web:x")
+             (.then (fn [_] (h/handle base "fold" {:graph g} "did:web:x")))
+             (.then (fn [_] (h/handle base "transact" {:graph g :tx_edn (tx 2)} "did:web:x")))
+             (.then (fn [_]
+                      (-> (h/do-fold store {:graph g})
+                          (.then (fn [f1]
+                                   (is (:ok f1)) (is (true? (:folded f1)))
+                                   (is (pos? (count @cache)) "cache-put! populated the cache")
+                                   (-> (h/do-fold store {:graph g})
+                                       (.then (fn [f2]
+                                                (is (:ok f2)) (is (true? (:folded f2)))
+                                                (is (= (:commit f1) (:commit f2))
+                                                    "retrying the identical fold via the cache converges to the identical result")
+                                                (done)))))))))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
    (deftest transact-then-filtered-read-roundtrip
      ;; ADR-2607032430 D1: transact never hydrates/rebuilds -- it only appends a
      ;; novelty tx block -- yet every read (datoms/pull/q) must still see that
