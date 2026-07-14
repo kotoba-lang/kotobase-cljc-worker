@@ -207,7 +207,14 @@
                                    ;; already pr-str'd EDN strings, no byte
                                    ;; encoding needed.
                                    :cache-get (fn [k] (r2/r2-get-text bucket (str pfx k)))
-                                   :cache-put! (fn [k v] (.put bucket (str pfx k) v))}
+                                   :cache-put! (fn [k v] (.put bucket (str pfx k) v))
+                                   ;; ADR-2607120730 follow-up: do-fold's hydrate
+                                   ;; step itself, NOT just what surrounds it
+                                   ;; (:max_novelty/:cache-get/:cache-put!), is
+                                   ;; O(N^2) over with-blocks -- see do-fold's
+                                   ;; docstring. Same direct/unbuffered R2 fetch
+                                   ;; as :cache-get, just returning raw bytes.
+                                   :async-get-fn (fn [cid] (r2/r2-get-bytes bucket (r2/block-key pfx cid)))}
                                   method body auth-did)))
                      (.then (fn [resp] (flush-blocks-and-cas-head! bucket pfx graph etag resp buffer)))))))))
 
