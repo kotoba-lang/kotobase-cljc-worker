@@ -11,7 +11,16 @@
     :get-fn      (fn [cid])          -> block bytes | nil
     :put!        (fn [cid bytes])    -> _ (writes block)
     :head-get    (fn [graph])        -> chain-cid string | nil
-    :head-put!   (fn [graph chain])  -> _ (updates the graph's chain head)"
+    :head-put!   (fn [graph chain])  -> _ (updates the graph's chain head)
+    :cache-get   (fn [key])          -> bytes|nil (OPTIONAL, do-fold only;
+                                        memoized-hydration cache read,
+                                        ADR-2607120730 Part 1 -- absent/nil
+                                        disables caching, no other behavior
+                                        change)
+    :cache-put!  (fn [key bytes])    -> _ (OPTIONAL, do-fold only; MUST write
+                                        through immediately/unbuffered, unlike
+                                        :put! -- see eng/hydrate-db-cached's
+                                        docstring for why)"
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
             [clojure.string :as str]
@@ -190,7 +199,20 @@
   budget can leave an unbounded fold unable to ever complete. A cron/ops
   caller can pass a small `:max_novelty` and call repeatedly to make
   guaranteed forward progress against such a backlog. Omitted/nil is
-  unbounded — identical to pre-existing behavior."
+  unbounded — identical to pre-existing behavior.
+
+  `:max_novelty` alone doesn't help once the EXISTING indexed snapshot
+  itself is too large to hydrate within one Worker's CPU budget — every
+  attempt pays that O(graph_shard) cost regardless of how small a novelty
+  slice it's folding (ADR-2607120730's root-cause diagnosis, confirmed
+  live: yoro-social-v2's fold kept failing with Cloudflare error 1102 even
+  bounded to 200). `(:cache-get store)`/`(:cache-put! store)` (both
+  optional in `store` — absent/nil disables this, unbounded `:max_novelty`-
+  only behavior unchanged) thread through to `eng/fold!`'s memoized-
+  hydration arity (ADR-2607120730 Part 1): a retry against the SAME still-
+  unfolded snapshot skips the expensive decrypt-and-scan and hits the
+  cache instead, so repeated failing cron ticks stop each re-paying the
+  full hydrate cost for zero progress."
   [store {:keys [graph max_novelty]}]
   (let [get-fn (:get-fn store)
         chain ((:head-get store) graph)
@@ -199,7 +221,8 @@
     (if (zero? novelty-n)
       {:ok true :graph graph :folded false}
       (then* (eng/fold! (:put! store) get-fn chain ipld/link? max-novelty
-                        crypto/blind-fn crypto/encrypt-fn crypto/decrypt-fn)
+                        crypto/blind-fn crypto/encrypt-fn crypto/decrypt-fn
+                        (:cache-get store) (:cache-put! store))
              (fn [new-chain]
                ((:head-put! store) graph new-chain)
                {:ok true :graph graph :folded true :commit new-chain
