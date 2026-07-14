@@ -105,20 +105,29 @@
 ;; ── read / write orchestration over R2 ───────────────────────────────────────
 
 (defn- run-read
-  "Reads (datoms/q/pull/diagHydrateCost): trampoline the sync handler through
-  R2 blocks. The graph head is read up front (one R2 text get) and injected
-  as a constant. `:async-get-fn` is a DIRECT R2 byte fetch (bypassing
-  with-blocks entirely) -- only diagHydrateCost reads it (ADR-2607120730
-  follow-up); every other method ignores it."
+  "Reads (datoms/q/pull/diagHydrateCost/diagCommitCost): trampoline the sync
+  handler through R2 blocks. The graph head is read up front (one R2 text
+  get) and injected as a constant. `:async-get-fn` is a DIRECT R2 byte fetch
+  (bypassing with-blocks entirely) -- only diagHydrateCost/diagCommitCost
+  read it (ADR-2607120730 follow-up); every other method ignores it.
+  `:put!` is BUFFERED (an in-memory atom, discarded after the response --
+  never flushed to R2), matching run-write-attempt's actual :put! during a
+  real commit!/fold! (blocks only reach R2 afterward, via flush-blocks-
+  and-cas-head!) -- only diagCommitCost uses it, to measure qs/commit!'s
+  CPU-only cost as production actually pays it, not inflated by real R2
+  write I/O this diagnostic doesn't need (nothing ever reads these blocks
+  back, since no head is advanced)."
   [^js bucket pfx method body]
   (-> (r2/r2-get-text bucket (r2/head-key pfx (:graph body)))
       (.then (fn [head-chain]
-               (r2/with-blocks
-                 (fn [cid] (r2/r2-get-bytes bucket (r2/block-key pfx cid)))
-                 (fn [sync-get]
-                   (h/handle {:get-fn sync-get :head-get (constantly head-chain)
-                              :async-get-fn (fn [cid] (r2/r2-get-bytes bucket (r2/block-key pfx cid)))}
-                             method body nil)))))))
+               (let [buffer (atom {})]
+                 (r2/with-blocks
+                   (fn [cid] (r2/r2-get-bytes bucket (r2/block-key pfx cid)))
+                   (fn [sync-get]
+                     (h/handle {:get-fn sync-get :head-get (constantly head-chain)
+                                :async-get-fn (fn [cid] (r2/r2-get-bytes bucket (r2/block-key pfx cid)))
+                                :put! (fn [cid bytes] (swap! buffer assoc cid bytes))}
+                               method body nil))))))))
 
 (defn- delay-ms [ms] (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
 
@@ -340,7 +349,7 @@
             (.then (fn [raw]
                      (let [body (js->clj raw :keywordize-keys true)]
                        (case method
-                         ("datoms" "q" "pull" "diagHydrateCost") (run-read (.-BUCKET env) (prefix env) method body)
+                         ("datoms" "q" "pull" "diagHydrateCost" "diagCommitCost") (run-read (.-BUCKET env) (prefix env) method body)
                          "transact"
                          ;; kotobase transact sends :db_name (+ cacao), NOT :graph —
                          ;; the graph is DERIVED as canonical-graph(issuer, db_name)
