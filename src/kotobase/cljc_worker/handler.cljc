@@ -22,21 +22,28 @@
                                         :put! -- see eng/hydrate-db-cached's
                                         docstring for why)
     :async-get-fn (fn [cid])         -> js/Promise<bytes|nil> (OPTIONAL,
-                                        do-fold and diagHydrateCost only; a
-                                        DIRECT R2 fetch, bypassing the
-                                        with-blocks sync-retry trampoline
-                                        entirely -- absent/nil falls back
-                                        to the with-blocks-trampolined
-                                        cold-datoms path exactly as before
-                                        this key existed. See do-fold's and
-                                        do-diag-hydrate-cost's docstrings.)"
+                                        do-fold and diagHydrateCost/
+                                        diagCommitCost only; a DIRECT R2
+                                        fetch, bypassing the with-blocks
+                                        sync-retry trampoline entirely --
+                                        absent/nil falls back to the with-
+                                        blocks-trampolined cold-datoms path
+                                        exactly as before this key existed.
+                                        See do-fold's, do-diag-hydrate-
+                                        cost's, and do-diag-commit-cost's
+                                        docstrings.)
+
+  diagCommitCost also uses `:put!` (writing real, content-addressed --
+  effectively idempotent when the graph is unchanged -- blocks; see its
+  own docstring)."
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
             [clojure.string :as str]
             [kotobase.cljc-worker.crypto :as crypto]
             [kotobase-peer.core :as eng]
             [ipld.core :as ipld]
-            [prolly-tree.core :as pt]))
+            [prolly-tree.core :as pt]
+            [arrangement.core :as qs]))
 
 (def datomic-ns "ai.gftd.apps.kotobase.datomic")
 
@@ -292,6 +299,56 @@
                      :entry_count (count rows)
                      :elapsed_ms (- (js/Date.now) start)})))))))
 
+(defn do-diag-commit-cost
+  "Read-ISH diagnostic (NOT part of the datomic surface; no auth, matching
+   diagHydrateCost's precedent -- see the tradeoff note below): measures
+   `fold!`'s WRITE side (`qs/commit!`'s 4x `prolly-tree.core/build-tree`
+   index rebuild) SEPARATELY from the READ side (`hydrate-db-cached`'s
+   walk+decrypt+in-memory-build, already isolated by `diagHydrateCost`).
+
+   Motivation (ADR-2607120730 follow-up, confirmed live): routing `fold!`'s
+   hydrate step through `scan-prefix-async` (5130 entries, ~800ms) did NOT
+   resolve `yoro-social-v2`'s CPU-exceeded failures -- a cron tick scheduled
+   well after that fix deployed still failed with error 1102. `decrypt-fn`
+   is confirmed a trivial passthrough (no real crypto yet), ruling out
+   decrypt cost. `qs/commit!` rebuilds ALL 4 covering indexes (spo/pso/pos/
+   ocp) from scratch via `build-tree`, none of which the read-side fix
+   touched -- `build-tree`'s `boundary?` computes a SHA-256 hash
+   SYNCHRONOUSLY per entry just to decide chunk boundaries, before any node
+   is even built, ×4 indexes. This measures whether THAT is the remaining
+   cost.
+
+   DOES actually call `qs/commit!` (via `(:put! store)`), so it pays the
+   REAL CPU cost -- but `(:put! store)` is expected to be a BUFFERED,
+   in-memory `put!` (never flushed to R2), matching how `fold!`'s own
+   `put!` behaves during the real computation (`kotobase-cljc-worker`'s
+   `run-write-attempt` also buffers, only flushing blocks to R2 AFTER the
+   whole response returns) -- this measures the same CPU-only cost
+   production actually pays, not inflated by real write I/O this
+   diagnostic doesn't need (nothing ever reads these blocks back, since no
+   head is advanced/read). `:cljs` only."
+  [store {:keys [graph]}]
+  #?(:clj
+     {:ok false :error "MethodNotImplemented" :message "diagCommitCost is :cljs-only"}
+     :cljs
+     (let [chain ((:head-get store) graph)
+           get-fn (:get-fn store)
+           snap (when chain (eng/latest-snapshot-cid get-fn chain))
+           async-get-fn (:async-get-fn store)
+           put! (:put! store)]
+       (if (nil? chain)
+         (js/Promise.resolve {:ok true :graph graph :hydrate_ms 0 :commit_ms 0})
+         (let [t0 (js/Date.now)]
+           (-> (eng/hydrate-db-cached get-fn snap crypto/blind-fn crypto/decrypt-fn nil nil async-get-fn)
+               (.then (fn [db]
+                        (let [t1 (js/Date.now)]
+                          (-> (qs/commit! put! db nil qs/current-schema-version crypto/blind-fn crypto/encrypt-fn)
+                              (.then (fn [_new-snap-cid]
+                                       (let [t2 (js/Date.now)]
+                                         {:ok true :graph graph :snapshot snap
+                                          :hydrate_ms (- t1 t0)
+                                          :commit_ms (- t2 t1)})))))))))))))
+
 ;; ── dispatch ─────────────────────────────────────────────────────────────────
 
 (defn handle
@@ -318,6 +375,7 @@
                    "pull"     (do-pull store body)
                    "fold"     (do-fold store body)
                    "diagHydrateCost" (do-diag-hydrate-cost store body)
+                   "diagCommitCost" (do-diag-commit-cost store body)
                    {:ok false :error "MethodNotImplemented" :method method})]
         ;; ADR-2607051000: on cljs the do-* fns return js/Promises (the
         ;; engine's crypto seam is Promise-based there) — async failures

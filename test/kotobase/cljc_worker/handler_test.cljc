@@ -366,3 +366,31 @@
                       (is (= 0 (:entry_count d)))
                       (done)))
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest diag-commit-cost-measures-hydrate-and-commit-separately-without-touching-the-head
+     ;; ADR-2607120730 follow-up: diagCommitCost isolates qs/commit!'s cost
+     ;; (the 4x prolly-tree.core/build-tree index rebuild) from
+     ;; hydrate-db-cached's cost -- proving the wiring is correct (store ->
+     ;; do-diag-commit-cost -> eng/hydrate-db-cached + qs/commit!) and that
+     ;; it never reads or advances the real head.
+     (async done
+       (let [base (mem-store)
+             store (assoc base
+                          :async-get-fn (fn [cid] (js/Promise.resolve ((:get-fn base) cid)))
+                          :put! (fn [_cid _bytes] nil)) ; buffered/discarded, matches production's real put! during commit!
+             tx (fn [n] (str "[{:db/id \"e" n "\" :ns/attr \"v" n "\"}]"))]
+         (-> (h/handle base "transact" {:graph g :tx_edn (tx 1)} "did:web:x")
+             (.then (fn [_] (h/handle base "fold" {:graph g} "did:web:x"))) ; real fold on `base`, warm-up
+             (.then (fn [_]
+                      (let [head-before ((:head-get base) g)]
+                        (-> (h/handle store "diagCommitCost" {:graph g} nil)
+                            (.then (fn [d]
+                                     (is (:ok d) (str "resp: " (pr-str d)))
+                                     (is (some? (:snapshot d)))
+                                     (is (number? (:hydrate_ms d)))
+                                     (is (number? (:commit_ms d)))
+                                     (is (= head-before ((:head-get base) g))
+                                         "diagCommitCost never advances/rewrites the real head")
+                                     (done)))))))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
