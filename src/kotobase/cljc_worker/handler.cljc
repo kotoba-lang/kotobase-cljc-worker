@@ -22,10 +22,14 @@
                                         :put! -- see eng/hydrate-db-cached's
                                         docstring for why)
     :async-get-fn (fn [cid])         -> js/Promise<bytes|nil> (OPTIONAL,
-                                        diagHydrateCost only; a DIRECT R2
-                                        fetch, bypassing the with-blocks
-                                        sync-retry trampoline entirely --
-                                        see do-diag-hydrate-cost)"
+                                        do-fold and diagHydrateCost only; a
+                                        DIRECT R2 fetch, bypassing the
+                                        with-blocks sync-retry trampoline
+                                        entirely -- absent/nil falls back
+                                        to the with-blocks-trampolined
+                                        cold-datoms path exactly as before
+                                        this key existed. See do-fold's and
+                                        do-diag-hydrate-cost's docstrings.)"
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
             [clojure.string :as str]
@@ -218,7 +222,20 @@
   hydration arity (ADR-2607120730 Part 1): a retry against the SAME still-
   unfolded snapshot skips the expensive decrypt-and-scan and hits the
   cache instead, so repeated failing cron ticks stop each re-paying the
-  full hydrate cost for zero progress."
+  full hydrate cost for zero progress.
+
+  `(:async-get-fn store)` (optional, absent/nil falls back exactly to the
+  pre-existing behavior) threads through to `eng/fold!`'s async-scan arity
+  (ADR-2607120730 follow-up): confirmed live against `yoro-social-v2`'s
+  real stuck backlog that neither `:max_novelty` nor `:cache-get`/`:cache-
+  put!` actually fix the CPU-exceeded failures, because BOTH only bound or
+  skip work AROUND the hydrate step — the hydrate itself, run over the
+  `with-blocks` sync-retry trampoline, is O(N^2) in the number of distinct
+  blocks touched (one-miss-discovered-per-retry re-walks and re-decodes
+  every already-fetched node), independent of graph size. A `diagHydrate
+  Cost` probe using `prolly-tree.core/scan-prefix-async` walked the same
+  5130-entry snapshot in 806ms. `:async-get-fn` routes the hydrate itself
+  through that batched-concurrent path instead."
   [store {:keys [graph max_novelty]}]
   (let [get-fn (:get-fn store)
         chain ((:head-get store) graph)
@@ -228,7 +245,7 @@
       {:ok true :graph graph :folded false}
       (then* (eng/fold! (:put! store) get-fn chain ipld/link? max-novelty
                         crypto/blind-fn crypto/encrypt-fn crypto/decrypt-fn
-                        (:cache-get store) (:cache-put! store))
+                        (:cache-get store) (:cache-put! store) (:async-get-fn store))
              (fn [new-chain]
                ((:head-put! store) graph new-chain)
                {:ok true :graph graph :folded true :commit new-chain

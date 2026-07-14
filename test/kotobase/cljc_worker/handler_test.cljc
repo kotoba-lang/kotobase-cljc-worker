@@ -159,6 +159,36 @@
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
 
 #?(:cljs
+   (deftest do-fold-async-get-fn-is-threaded-through-and-produces-a-correct-fold
+     ;; ADR-2607120730 follow-up: do-fold passes (:async-get-fn store) through
+     ;; to eng/fold!'s async-scan arity, routing the hydrate step itself
+     ;; through prolly-tree.core/scan-prefix-async instead of the with-blocks-
+     ;; trampolined sync path -- this proves the WIRING is correct end to end
+     ;; (correctness); the underlying O(N) vs O(N^2) performance story is
+     ;; kotobase-peer's own test suite's job, and was additionally confirmed
+     ;; live against the real stuck yoro-social-v2 backlog (5130 entries,
+     ;; 806ms via scan-prefix-async vs. a 300s CPU budget exceeded before).
+     (async done
+       (let [base (mem-store)
+             store (assoc base :async-get-fn (fn [cid] (js/Promise.resolve ((:get-fn base) cid))))
+             tx (fn [n] (str "[{:db/id \"e" n "\" :ns/attr \"v" n "\"}]"))]
+         (-> (h/handle base "transact" {:graph g :tx_edn (tx 1)} "did:web:x")
+             (.then (fn [_] (h/handle base "transact" {:graph g :tx_edn (tx 2)} "did:web:x")))
+             (.then (fn [_] (h/do-datoms base {:graph g})))
+             (.then (fn [before]
+                      (-> (h/handle store "fold" {:graph g} "did:web:x")
+                          (.then (fn [f]
+                                   (is (:ok f)) (is (true? (:folded f)))
+                                   (is (= 0 (eng/novelty-size (:get-fn base) (:commit f)))
+                                       "fold via :async-get-fn still fully compacts")
+                                   (h/do-datoms base {:graph g})))
+                          (.then (fn [after]
+                                   (is (= (set (:datoms before)) (set (:datoms after)))
+                                       "folding via :async-get-fn loses/duplicates nothing")
+                                   (done))))))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
    (deftest transact-then-filtered-read-roundtrip
      ;; ADR-2607032430 D1: transact never hydrates/rebuilds -- it only appends a
      ;; novelty tx block -- yet every read (datoms/pull/q) must still see that
