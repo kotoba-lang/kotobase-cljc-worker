@@ -20,13 +20,19 @@
     :cache-put!  (fn [key bytes])    -> _ (OPTIONAL, do-fold only; MUST write
                                         through immediately/unbuffered, unlike
                                         :put! -- see eng/hydrate-db-cached's
-                                        docstring for why)"
+                                        docstring for why)
+    :async-get-fn (fn [cid])         -> js/Promise<bytes|nil> (OPTIONAL,
+                                        diagHydrateCost only; a DIRECT R2
+                                        fetch, bypassing the with-blocks
+                                        sync-retry trampoline entirely --
+                                        see do-diag-hydrate-cost)"
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
             [clojure.string :as str]
             [kotobase.cljc-worker.crypto :as crypto]
             [kotobase-peer.core :as eng]
-            [ipld.core :as ipld]))
+            [ipld.core :as ipld]
+            [prolly-tree.core :as pt]))
 
 (def datomic-ns "ai.gftd.apps.kotobase.datomic")
 
@@ -229,6 +235,46 @@
                 :novelty_folded (if max-novelty (min max-novelty novelty-n) novelty-n)
                 :novelty_remaining (if max-novelty (max 0 (- novelty-n max-novelty)) 0)})))))
 
+(defn do-diag-hydrate-cost
+  "Read-only diagnostic (NOT part of the datomic surface, no write, no fold,
+   no risk to the graph): reports how many leaf entries the graph's current
+   indexed snapshot's full `:eavt` tree holds, and how long a batched-
+   concurrent walk of it takes.
+
+   Measures the suspected dominant contributor to `fold!`'s `hydrate-db`
+   exceeding a Worker's CPU budget (gftdcojp/app-aozora#78, ADR-2607120730
+   follow-up): `scan-prefix` run over the `with-blocks` sync-retry
+   trampoline re-walks and re-decodes every already-fetched node on every
+   retry (O(N^2) for a tree touching N distinct blocks), independent of
+   whether the tree is simply too large in absolute terms. This uses
+   `prolly-tree.core/scan-prefix-async` with `(:async-get-fn store)` — a
+   DIRECT R2 fetch that bypasses `with-blocks` entirely — so the numbers
+   this returns isolate walk+decode cost from that retry-inflation, letting
+   a real production run distinguish \"N itself is too large\" from \"the
+   discovery strategy is quadratic.\" Does NOT decrypt/hydrate/build a db;
+   `:entry_count` is a raw leaf-entry count, not decoded quad values.
+   `:cljs` only (`scan-prefix-async` doesn't exist on `:clj` — this
+   diagnostic exists to measure a Worker/R2-latency-specific retry-
+   inflation problem that has no JVM analog)."
+  [store {:keys [graph]}]
+  #?(:clj
+     {:ok false :error "MethodNotImplemented" :message "diagHydrateCost is :cljs-only"}
+     :cljs
+     (let [chain ((:head-get store) graph)
+           snap (when chain (eng/latest-snapshot-cid (:get-fn store) chain))
+           root-cid (when snap
+                      (some-> (get-in (ipld/decode ((:get-fn store) snap)) ["index-roots" "spo"])
+                              ipld/link-cid))
+           async-get-fn (:async-get-fn store)]
+       (if (nil? root-cid)
+         (js/Promise.resolve {:ok true :graph graph :snapshot snap :entry_count 0 :elapsed_ms 0})
+         (let [start (js/Date.now)]
+           (then* (pt/scan-prefix-async async-get-fn root-cid "")
+                  (fn [rows]
+                    {:ok true :graph graph :snapshot snap
+                     :entry_count (count rows)
+                     :elapsed_ms (- (js/Date.now) start)})))))))
+
 ;; ── dispatch ─────────────────────────────────────────────────────────────────
 
 (defn handle
@@ -254,6 +300,7 @@
                    "q"        (do-q store body)
                    "pull"     (do-pull store body)
                    "fold"     (do-fold store body)
+                   "diagHydrateCost" (do-diag-hydrate-cost store body)
                    {:ok false :error "MethodNotImplemented" :method method})]
         ;; ADR-2607051000: on cljs the do-* fns return js/Promises (the
         ;; engine's crypto seam is Promise-based there) — async failures

@@ -297,3 +297,42 @@
                         (is (= #{"post/2"} (set (map :e (:datoms r))))))
                       (done)))
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest diag-hydrate-cost-counts-entries-in-the-indexed-snapshot
+     ;; ADR-2607120730 follow-up: diagHydrateCost is a read-only diagnostic
+     ;; that walks the current indexed snapshot via
+     ;; prolly-tree.core/scan-prefix-async (:async-get-fn, a direct fetch
+     ;; bypassing with-blocks entirely) and reports how many leaf entries it
+     ;; holds -- proving the wiring (store -> do-diag-hydrate-cost ->
+     ;; scan-prefix-async) is correct end to end.
+     (async done
+       (let [base (mem-store)
+             store (assoc base :async-get-fn (fn [cid] (js/Promise.resolve ((:get-fn base) cid))))
+             tx (fn [n] (str "[{:db/id \"e" n "\" :ns/attr \"v" n "\"}]"))]
+         (-> (h/handle store "transact" {:graph g :tx_edn (tx 1)} "did:web:x")
+             (.then (fn [_] (h/handle store "transact" {:graph g :tx_edn (tx 2)} "did:web:x")))
+             (.then (fn [_] (h/handle store "transact" {:graph g :tx_edn (tx 3)} "did:web:x")))
+             (.then (fn [_] (h/handle store "fold" {:graph g} "did:web:x")))
+             (.then (fn [f]
+                      (is (:ok f)) (is (true? (:folded f)) "fold populates the indexed snapshot")
+                      (h/handle store "diagHydrateCost" {:graph g} nil)))
+             (.then (fn [d]
+                      (is (:ok d))
+                      (is (some? (:snapshot d)))
+                      (is (= 3 (:entry_count d)) "3 folded entities -> 3 leaf entries in the :eavt tree")
+                      (is (number? (:elapsed_ms d)))
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest diag-hydrate-cost-on-an-unfolded-graph-is-a-safe-zero
+     (async done
+       (let [store (assoc (mem-store) :async-get-fn (fn [_] (js/Promise.resolve nil)))]
+         (-> (h/handle store "diagHydrateCost" {:graph g} nil)
+             (.then (fn [d]
+                      (is (:ok d))
+                      (is (nil? (:snapshot d)))
+                      (is (= 0 (:entry_count d)))
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
