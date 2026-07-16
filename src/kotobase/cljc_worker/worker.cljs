@@ -349,7 +349,7 @@
             (.then (fn [raw]
                      (let [body (js->clj raw :keywordize-keys true)]
                        (case method
-                         ("datoms" "q" "pull" "diagHydrateCost" "diagCommitCost") (run-read (.-BUCKET env) (prefix env) method body)
+                         ("datoms" "q" "pull" "view" "diagHydrateCost" "diagCommitCost") (run-read (.-BUCKET env) (prefix env) method body)
                          "transact"
                          ;; kotobase transact sends :db_name (+ cacao), NOT :graph —
                          ;; the graph is DERIVED as canonical-graph(issuer, db_name)
