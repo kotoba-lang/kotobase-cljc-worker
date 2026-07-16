@@ -249,17 +249,19 @@
   declares/updates the graph's materialized views, which every fold
   (with or without this param — stored specs carry forward) re-derives from
   the merged db and writes as one content-addressed views block linked from
-  the chain state. Served by `datomic.view` (`do-view`). NOTE: a views_edn-
-  only call against a graph with zero novelty is currently a no-op (the
-  zero-novelty early return below) — declare views while writes are flowing,
-  or transact once before declaring."
+  the chain state. Served by `datomic.view` (`do-view`). A views_edn call
+  against a graph with ZERO novelty still runs a views-only fold (the
+  zero-novelty early return is bypassed when views_edn is present, and
+  fold! over empty novelty re-commits the identical content-addressed
+  snapshot — cheap — while materializing the views): declaring a view on a
+  quiet graph works immediately instead of waiting for the next write."
   [store {:keys [graph max_novelty views_edn]}]
   (let [get-fn (:get-fn store)
         chain ((:head-get store) graph)
         novelty-n (if chain (eng/novelty-size get-fn chain) 0)
         max-novelty (when (pos-int? max_novelty) max_novelty)
         views (when (seq views_edn) (edn/read-string views_edn))]
-    (if (zero? novelty-n)
+    (if (and (zero? novelty-n) (or (nil? views) (nil? chain)))
       {:ok true :graph graph :folded false}
       (then* (eng/fold! (:put! store) get-fn chain ipld/link? max-novelty
                         crypto/blind-fn crypto/encrypt-fn crypto/decrypt-fn
