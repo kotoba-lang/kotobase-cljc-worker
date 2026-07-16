@@ -163,3 +163,37 @@
                    (is (contains? #{"chainA" "chainB"} chain)
                        "the surviving head is one of the two racers' commits, not corrupted")
                    (done)))))))
+
+;; ── immutable block memory cache (ADR-2607167000) ─────────────────────────────
+
+(deftest cached-block-bytes-fetches-r2-once-per-cid
+  (async done
+    (let [calls (atom 0)
+          bytes (js/Uint8Array. #js [1 2 3])
+          bucket #js {:get (fn [_k]
+                             (swap! calls inc)
+                             (js/Promise.resolve
+                              #js {:arrayBuffer (fn [] (js/Promise.resolve (.-buffer bytes)))}))}]
+      (-> (r2/cached-block-bytes bucket "t/" "bafy-cache-test-1")
+          (.then (fn [b1]
+                   (is (= 3 (.-length b1)))
+                   (r2/cached-block-bytes bucket "t/" "bafy-cache-test-1")))
+          (.then (fn [b2]
+                   (is (= 3 (.-length b2)))
+                   (is (= 1 @calls) "second read served from isolate memory, no R2 get")
+                   (done)))
+          (.catch (fn [e] (is false (str "rejected: " e)) (done)))))))
+
+(deftest cached-block-bytes-does-not-cache-nil
+  (async done
+    (let [calls (atom 0)
+          bucket #js {:get (fn [_k] (swap! calls inc) (js/Promise.resolve nil))}]
+      (-> (r2/cached-block-bytes bucket "t/" "bafy-cache-test-absent")
+          (.then (fn [b1]
+                   (is (nil? b1))
+                   (r2/cached-block-bytes bucket "t/" "bafy-cache-test-absent")))
+          (.then (fn [b2]
+                   (is (nil? b2))
+                   (is (= 2 @calls) "absent blocks are re-checked (not negatively cached)")
+                   (done)))
+          (.catch (fn [e] (is false (str "rejected: " e)) (done)))))))

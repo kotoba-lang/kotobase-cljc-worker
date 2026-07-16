@@ -122,10 +122,10 @@
       (.then (fn [head-chain]
                (let [buffer (atom {})]
                  (r2/with-blocks
-                   (fn [cid] (r2/r2-get-bytes bucket (r2/block-key pfx cid)))
+                   (fn [cid] (r2/cached-block-bytes bucket pfx cid))
                    (fn [sync-get]
                      (h/handle {:get-fn sync-get :head-get (constantly head-chain)
-                                :async-get-fn (fn [cid] (r2/r2-get-bytes bucket (r2/block-key pfx cid)))
+                                :async-get-fn (fn [cid] (r2/cached-block-bytes bucket pfx cid))
                                 :put! (fn [cid bytes] (swap! buffer assoc cid bytes))}
                                method body nil))))))))
 
@@ -189,7 +189,7 @@
     (-> (r2/r2-get-head bucket (r2/head-key pfx graph))
         (.then (fn [{:keys [chain etag]}]
                  (-> (r2/with-blocks
-                      (fn [cid] (r2/r2-get-bytes bucket (r2/block-key pfx cid)))
+                      (fn [cid] (r2/cached-block-bytes bucket pfx cid))
                       (fn [sync-get]
                         (h/handle {:get-fn (fn [cid] (if (contains? @buffer cid)
                                                         (get @buffer cid)
@@ -223,7 +223,7 @@
                                    ;; O(N^2) over with-blocks -- see do-fold's
                                    ;; docstring. Same direct/unbuffered R2 fetch
                                    ;; as :cache-get, just returning raw bytes.
-                                   :async-get-fn (fn [cid] (r2/r2-get-bytes bucket (r2/block-key pfx cid)))}
+                                   :async-get-fn (fn [cid] (r2/cached-block-bytes bucket pfx cid))}
                                   method body auth-did)))
                      (.then (fn [resp] (flush-blocks-and-cas-head! bucket pfx graph etag resp buffer)))))))))
 

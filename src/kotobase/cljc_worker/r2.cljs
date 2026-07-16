@@ -66,6 +66,44 @@
                (when obj
                  (-> (.arrayBuffer obj) (.then #(js/Uint8Array. %))))))))
 
+;; ── immutable block memory cache (ADR-2607167000) ────────────────────────────
+;; CID-addressed blocks are IMMUTABLE — bytes for a cid can never change, so
+;; caching them in isolate memory changes no semantics, only cost (the exact
+;; property IPFS caching everywhere rests on). Only the mutable HEAD pointer
+;; must be read fresh every request; nothing here ever touches head keys.
+;; The isolate persists across requests on a warm Worker, so hot blocks
+;; (chain head state nodes, the views block, prolly-tree roots) serve from
+;; memory (~0ms) instead of one R2 round trip each — the dominant share of
+;; the measured ~1.2s/request unit cost. FIFO byte-budget eviction rides
+;; js/Map's insertion order; a fresh isolate just starts cold (correct,
+;; slower). nil fetches (block not in R2 YET — e.g. buffered writes not
+;; flushed) are NOT cached, so a later read re-checks R2.
+
+(def ^:private block-cache (js/Map.))
+(def ^:private block-cache-bytes (atom 0))
+(def ^:private block-cache-budget (* 64 1024 1024))
+
+(defn- block-cache-put! [cid ^js bytes]
+  (when (and (some? bytes) (not (.has block-cache cid)))
+    (.set block-cache cid bytes)
+    (swap! block-cache-bytes + (.-length bytes))
+    (loop []
+      (when (> @block-cache-bytes block-cache-budget)
+        (let [oldest (.-value (.next (.keys block-cache)))]
+          (when (some? oldest)
+            (swap! block-cache-bytes - (.-length (.get block-cache oldest)))
+            (.delete block-cache oldest)
+            (recur)))))))
+
+(defn cached-block-bytes
+  "Promise<Uint8Array|nil> for an immutable block `cid`: isolate-memory cache
+  first, R2 on miss (populating the cache on a non-nil result)."
+  [^js bucket pfx cid]
+  (if (.has block-cache cid)
+    (js/Promise.resolve (.get block-cache cid))
+    (-> (r2-get-bytes bucket (block-key pfx cid))
+        (.then (fn [bytes] (block-cache-put! cid bytes) bytes)))))
+
 (defn r2-put-bytes [^js bucket k ^js bytes] (.put bucket k bytes))
 
 (defn r2-get-text
