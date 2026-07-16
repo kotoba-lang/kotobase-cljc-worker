@@ -242,22 +242,50 @@
   every already-fetched node), independent of graph size. A `diagHydrate
   Cost` probe using `prolly-tree.core/scan-prefix-async` walked the same
   5130-entry snapshot in 806ms. `:async-get-fn` routes the hydrate itself
-  through that batched-concurrent path instead."
-  [store {:keys [graph max_novelty]}]
+  through that batched-concurrent path instead.
+
+  Optional body `:views_edn` (an EDN string map of view-name →
+  {\"attrs\" [attr …]}, or a nil spec to remove that view — ADR-2607166600):
+  declares/updates the graph's materialized views, which every fold
+  (with or without this param — stored specs carry forward) re-derives from
+  the merged db and writes as one content-addressed views block linked from
+  the chain state. Served by `datomic.view` (`do-view`). NOTE: a views_edn-
+  only call against a graph with zero novelty is currently a no-op (the
+  zero-novelty early return below) — declare views while writes are flowing,
+  or transact once before declaring."
+  [store {:keys [graph max_novelty views_edn]}]
   (let [get-fn (:get-fn store)
         chain ((:head-get store) graph)
         novelty-n (if chain (eng/novelty-size get-fn chain) 0)
-        max-novelty (when (pos-int? max_novelty) max_novelty)]
+        max-novelty (when (pos-int? max_novelty) max_novelty)
+        views (when (seq views_edn) (edn/read-string views_edn))]
     (if (zero? novelty-n)
       {:ok true :graph graph :folded false}
       (then* (eng/fold! (:put! store) get-fn chain ipld/link? max-novelty
                         crypto/blind-fn crypto/encrypt-fn crypto/decrypt-fn
-                        (:cache-get store) (:cache-put! store) (:async-get-fn store))
+                        (:cache-get store) (:cache-put! store) (:async-get-fn store)
+                        views)
              (fn [new-chain]
                ((:head-put! store) graph new-chain)
                {:ok true :graph graph :folded true :commit new-chain
                 :novelty_folded (if max-novelty (min max-novelty novelty-n) novelty-n)
                 :novelty_remaining (if max-novelty (max 0 (- novelty-n max-novelty)) 0)})))))
+
+(defn do-view
+  "`datomic.view` — rows of a fold-materialized view (ADR-2607166600),
+  always fresh: the views block's rows merged with unfolded novelty
+  server-side (eng/view-rows). Body: {:graph :view}. Response mirrors
+  do-datoms (`:datoms` rows) so existing row consumers work unchanged;
+  `{:ok false :error \"ViewNotFound\"}` when the view was never
+  materialized for this graph."
+  [store {:keys [graph view]}]
+  (let [chain ((:head-get store) graph)]
+    (then* (eng/view-rows (:get-fn store) chain view (constantly true) crypto/decrypt-fn)
+           (fn [res]
+             (if res
+               {:ok true :graph graph :view view :spec (:spec res)
+                :datoms (vec (:rows res))}
+               {:ok false :error "ViewNotFound" :graph graph :view view})))))
 
 (defn do-diag-hydrate-cost
   "Read-only diagnostic (NOT part of the datomic surface, no write, no fold,
@@ -373,6 +401,7 @@
                    "transact" (do-transact store body auth-did)
                    "q"        (do-q store body)
                    "pull"     (do-pull store body)
+                   "view"     (do-view store body)
                    "fold"     (do-fold store body)
                    "diagHydrateCost" (do-diag-hydrate-cost store body)
                    "diagCommitCost" (do-diag-commit-cost store body)

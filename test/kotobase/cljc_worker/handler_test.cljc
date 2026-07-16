@@ -394,3 +394,56 @@
                                          "diagCommitCost never advances/rewrites the real head")
                                      (done)))))))
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+;; ── materialized views (ADR-2607166600 IVM) ──────────────────────────────────
+
+#?(:cljs
+   (deftest fold-with-views-edn-materializes-and-do-view-serves-fresh-rows
+     (async done
+       (let [store (mem-store)]
+         (-> (h/handle store "transact"
+                       {:graph g :tx_edn "[{:db/id \"p1\" :yoro.post/uri \"at://p1\" :yoro.post/text \"hi\"}]"}
+                       "did:web:x")
+             (.then (fn [_] (h/handle store "fold"
+                                      {:graph g :views_edn "{\"feed\" {\"attrs\" [\":yoro.post/uri\"]}}"}
+                                      "did:web:x")))
+             (.then (fn [f]
+                      (is (:ok f))
+                      (is (true? (:folded f)))
+                      (h/handle store "view" {:graph g :view "feed"} nil)))
+             (.then (fn [v]
+                      (is (:ok v))
+                      (is (= {"attrs" [":yoro.post/uri"]} (:spec v)))
+                      (is (= [{:e "p1" :a ":yoro.post/uri" :v_edn "\"at://p1\"" :added true}]
+                             (:datoms v))
+                          "only spec attrs — the text row is excluded")
+                      ;; post-fold novelty is merged fresh by do-view
+                      (h/handle store "transact"
+                                {:graph g :tx_edn "[{:db/id \"p2\" :yoro.post/uri \"at://p2\"}]"}
+                                "did:web:x")))
+             (.then (fn [_] (h/handle store "view" {:graph g :view "feed"} nil)))
+             (.then (fn [v2]
+                      (is (= #{"at://p1" "at://p2"}
+                             (set (map #(-> % :v_edn (subs 1) (->> (drop-last 1) (apply str)))
+                                       (:datoms v2))))
+                          "an unfolded novelty assertion appears without a new fold")
+                      ;; spec-less fold carries the view forward
+                      (h/handle store "fold" {:graph g} "did:web:x")))
+             (.then (fn [_] (h/handle store "view" {:graph g :view "feed"} nil)))
+             (.then (fn [v3]
+                      (is (:ok v3))
+                      (is (= 2 (count (:datoms v3))) "carry-forward re-materialized both rows")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest do-view-unknown-view-is-a-clean-error
+     (async done
+       (let [store (mem-store)]
+         (-> (h/handle store "transact" {:graph g :tx_edn "[{:db/id \"e\" :a/x \"v\"}]"} "did:web:x")
+             (.then (fn [_] (h/handle store "view" {:graph g :view "nope"} nil)))
+             (.then (fn [v]
+                      (is (false? (:ok v)))
+                      (is (= "ViewNotFound" (:error v)))
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
