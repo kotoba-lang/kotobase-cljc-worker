@@ -447,3 +447,25 @@
                       (is (= "ViewNotFound" (:error v)))
                       (done)))
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest views-only-fold-on-zero-novelty-graph-materializes-immediately
+     ;; a quiet graph (all novelty already folded) + views_edn must still
+     ;; materialize — the zero-novelty early return is bypassed when views
+     ;; are declared (ADR-2607166600 follow-up, closed).
+     (async done
+       (let [store (mem-store)]
+         (-> (h/handle store "transact" {:graph g :tx_edn "[{:db/id \"p\" :a/x \"v\"}]"} "did:web:x")
+             (.then (fn [_] (h/handle store "fold" {:graph g} "did:web:x")))   ; drain novelty
+             (.then (fn [_] (h/handle store "fold"
+                                      {:graph g :views_edn "{\"xs\" {\"attrs\" [\":a/x\"]}}"}
+                                      "did:web:x")))
+             (.then (fn [f]
+                      (is (:ok f))
+                      (is (true? (:folded f)) "views-only fold ran despite zero novelty")
+                      (h/handle store "view" {:graph g :view "xs"} nil)))
+             (.then (fn [v]
+                      (is (:ok v))
+                      (is (= [{:e "p" :a ":a/x" :v_edn "\"v\"" :added true}] (:datoms v)))
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
