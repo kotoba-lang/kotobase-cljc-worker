@@ -469,3 +469,70 @@
                       (is (= [{:e "p" :a ":a/x" :v_edn "\"v\"" :added true}] (:datoms v)))
                       (done)))
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+;; ── visibility redaction (ADR-2607174500 = ADR-2607050500 Phase 3) ───────────
+
+#?(:cljs
+   (deftest policy-redacts-protected-attrs-for-anonymous-and-capability-opens
+     (async done
+       (let [store (mem-store)
+             caps {:did "did:web:reader" :resources ["kotoba://can/datom:read-protected"]}]
+         (-> (h/handle store "transact"
+                       {:graph g
+                        :tx_edn (str "[{:db/id \"kotobase.policy/read\" "
+                                     ":kotobase.policy/protected-prefixes \"[\\\":dm.\\\"]\"} "
+                                     "{:db/id \"m1\" :dm.message/text \"secret hello\"} "
+                                     "{:db/id \"p1\" :yoro.post/text \"public post\"}]")}
+                       "did:web:x")
+             ;; anonymous: protected prefix redacted, public + policy visible
+             (.then (fn [_] (h/handle store "datoms" {:graph g} nil)))
+             (.then (fn [r]
+                      (let [attrs (set (map :a (:datoms r)))]
+                        (is (contains? attrs ":yoro.post/text"))
+                        (is (contains? attrs ":kotobase.policy/protected-prefixes")
+                            "policy itself stays inspectable")
+                        (is (not (contains? attrs ":dm.message/text"))
+                            "protected attr redacted for anonymous"))
+                      ;; q is redacted the same way
+                      (h/handle store "q" {:graph g :query_edn "[nil \":dm.message/text\" nil]"} nil)))
+             (.then (fn [r]
+                      (is (empty? (:rows r)) "q sees no protected rows anonymously")
+                      ;; pull of the protected entity comes back empty
+                      (h/handle store "pull" {:graph g :entity "m1"} nil)))
+             (.then (fn [r]
+                      (is (empty? (:attrs r)) "pull redacts the protected entity")
+                      ;; capability opens everything
+                      (h/handle store "datoms" {:graph g} caps)))
+             (.then (fn [r]
+                      (is (contains? (set (map :a (:datoms r))) ":dm.message/text")
+                          "datom:read-protected capability opens protected rows")
+                      ;; view rows honor the same filter
+                      (h/handle store "fold"
+                                {:graph g :views_edn "{\"dms\" {\"attrs\" [\":dm.message/text\" \":yoro.post/text\"]}}"}
+                                "did:web:x")))
+             (.then (fn [_] (h/handle store "view" {:graph g :view "dms"} nil)))
+             (.then (fn [r]
+                      (let [attrs (set (map :a (:datoms r)))]
+                        (is (contains? attrs ":yoro.post/text"))
+                        (is (not (contains? attrs ":dm.message/text"))
+                            "view reads redact for anonymous too"))
+                      (h/handle store "view" {:graph g :view "dms"} caps)))
+             (.then (fn [r]
+                      (is (contains? (set (map :a (:datoms r))) ":dm.message/text")
+                          "capability opens view rows")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest policy-less-graph-stays-fully-public
+     (async done
+       (let [store (mem-store)]
+         (-> (h/handle store "transact"
+                       {:graph g :tx_edn "[{:db/id \"m1\" :dm.message/text \"hi\"}]"}
+                       "did:web:x")
+             (.then (fn [_] (h/handle store "datoms" {:graph g} nil)))
+             (.then (fn [r]
+                      (is (contains? (set (map :a (:datoms r))) ":dm.message/text")
+                          "no policy entity → everything visible (zero regression)")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))

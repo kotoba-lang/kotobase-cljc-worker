@@ -59,6 +59,40 @@
         iss))
     (catch :default _ nil)))
 
+(defn verify-cacao-full
+  "→ {:did <issuer> :resources [<capability/graph strings>]} | nil. Same
+  verification as verify-cacao, additionally surfacing the CACAO's
+  resources so reads can apply capability-scoped visibility
+  (ADR-2607174500 / ADR-2607050500 Phase 3)."
+  [cacao-b64]
+  (try
+    (let [^js env (.decode dag-cbor (cacao/base64->bytes cacao-b64))
+          ^js p   (.-p env)
+          iss (.-iss p)
+          pub (cid/did-key->ed25519-pub iss)
+          exp (.-exp p)
+          expired? (expired? exp)
+          resources (vec (.-resources p))
+          p-clj {:domain (.-domain p) :iss iss :aud (.-aud p) :version (.-version p)
+                 :nonce (.-nonce p) :iat (.-iat p) :exp exp :statement (.-statement p)
+                 :resources resources}
+          msg (cacao/cacao-siwe-message p-clj)
+          sig (cacao/base64url->bytes (.. env -s -s))]
+      (when (and pub (not expired?) (.verify ed25519 sig (cid/text->bytes msg) pub))
+        {:did iss :resources resources}))
+    (catch :default _ nil)))
+
+(defn- request-auth
+  "Best-effort viewer identity for a READ: the `authorization: CACAO <b64>`
+  header or the body's :cacao_b64, verified in full. nil (anonymous) when
+  absent/invalid — reads stay open; a graph POLICY decides what an
+  anonymous viewer sees (ADR-2607174500)."
+  [^js req body]
+  (let [hdr (some-> (.get (.-headers req) "authorization") str)
+        b64 (or (when (and hdr (str/starts-with? hdr "CACAO ")) (subs hdr 6))
+                (:cacao_b64 body))]
+    (some-> b64 verify-cacao-full)))
+
 (defn- authorized?
   "A transact is authorized iff a CACAO VERIFIED (issuer non-nil) and — when a
   non-empty operator allowlist is configured — the issuer is on it. An empty
@@ -117,7 +151,7 @@
   CPU-only cost as production actually pays it, not inflated by real R2
   write I/O this diagnostic doesn't need (nothing ever reads these blocks
   back, since no head is advanced)."
-  [^js bucket pfx method body]
+  [^js bucket pfx method body auth]
   (-> (r2/r2-get-text bucket (r2/head-key pfx (:graph body)))
       (.then (fn [head-chain]
                (let [buffer (atom {})]
@@ -127,7 +161,7 @@
                      (h/handle {:get-fn sync-get :head-get (constantly head-chain)
                                 :async-get-fn (fn [cid] (r2/cached-block-bytes bucket pfx cid))
                                 :put! (fn [cid bytes] (swap! buffer assoc cid bytes))}
-                               method body nil))))))))
+                               method body auth))))))))
 
 (defn- delay-ms [ms] (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
 
@@ -349,7 +383,8 @@
             (.then (fn [raw]
                      (let [body (js->clj raw :keywordize-keys true)]
                        (case method
-                         ("datoms" "q" "pull" "view" "diagHydrateCost" "diagCommitCost") (run-read (.-BUCKET env) (prefix env) method body)
+                         ("datoms" "q" "pull" "view" "diagHydrateCost" "diagCommitCost")
+                         (run-read (.-BUCKET env) (prefix env) method body (request-auth req body))
                          "transact"
                          ;; kotobase transact sends :db_name (+ cacao), NOT :graph —
                          ;; the graph is DERIVED as canonical-graph(issuer, db_name)
