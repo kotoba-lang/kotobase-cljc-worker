@@ -536,3 +536,27 @@
                           "no policy entity → everything visible (zero regression)")
                       (done)))
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest owner-based-disclosure-viewer-sees-own-protected-rows
+     (async done
+       (let [store (mem-store)
+             alice {:did "did:web:alice" :resources []}]
+         (-> (h/handle store "transact"
+                       {:graph g
+                        :tx_edn (str "[{:db/id \"kotobase.policy/read\" "
+                                     ":kotobase.policy/protected-prefixes \"[\\\":dm.\\\"]\" "
+                                     ":kotobase.policy/owner-attrs \"[\\\":dm.message/author\\\"]\"} "
+                                     "{:db/id \"m1\" :dm.message/author \"did:web:alice\" :dm.message/text \"alice note\"} "
+                                     "{:db/id \"m2\" :dm.message/author \"did:web:bob\" :dm.message/text \"bob note\"}]")}
+                       "did:web:x")
+             (.then (fn [_] (h/handle store "datoms" {:graph g} alice)))
+             (.then (fn [r]
+                      (let [texts (set (keep (fn [d] (when (= ":dm.message/text" (:a d)) (:v_edn d))) (:datoms r)))]
+                        (is (contains? texts "\"alice note\"") "owner sees own")
+                        (is (not (contains? texts "\"bob note\"")) "owner not another's"))
+                      (h/handle store "datoms" {:graph g} nil)))
+             (.then (fn [r]
+                      (is (empty? (filter #(= ":dm.message/text" (:a %)) (:datoms r))) "anon sees none")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))

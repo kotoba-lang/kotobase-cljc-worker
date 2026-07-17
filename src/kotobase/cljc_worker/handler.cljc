@@ -107,19 +107,53 @@
 (defn- index-kw [index]
   (when (seq index) (keyword (cond-> index (str/starts-with? index ":") (subs 1)))))
 
+(defn- owned-entities
+  "Entity ids the viewer OWNS per the policy's :owner-attrs (Phase 3c):
+  one narrow :avet [owner-attr viewer-did] scan per owner attr. Empty when
+  the policy declares no owner-attrs or the viewer is anonymous. Promise on
+  cljs."
+  [store chain policy viewer-did]
+  (let [owner-attrs (:owner-attrs policy)]
+    (if (or (nil? chain) (empty? owner-attrs) (nil? viewer-did))
+      #?(:clj #{} :cljs (js/Promise.resolve #{}))
+      #?(:clj
+         (into #{}
+               (mapcat (fn [attr]
+                         (->> (eng/hot-datoms (:get-fn store) chain
+                                              {:index :avet :components [attr viewer-did]}
+                                              (constantly true) crypto/blind-fn crypto/decrypt-fn)
+                              (map :e))))
+               owner-attrs)
+         :cljs
+         (-> (js/Promise.all
+              (into-array
+               (map (fn [attr]
+                      (eng/hot-datoms (:get-fn store) chain
+                                      {:index :avet :components [attr viewer-did]}
+                                      (constantly true) crypto/blind-fn crypto/decrypt-fn))
+                    owner-attrs)))
+             (.then (fn [^js lists]
+                      (into #{} (mapcat #(map :e %)) (array-seq lists)))))))))
+
 (defn- request-visible?
-  "The per-request `visible?` row filter (ADR-2607174500 = ADR-2607050500
-  Phase 3): ONE narrow entity read of the graph's in-chain policy entity,
-  combined with the viewer's VERIFIED CACAO capability resources. A graph
-  with no policy entity yields (constantly true) — fully public, exactly
-  the pre-Phase-3 behavior. Promise on cljs (hot-datoms' platform split)."
-  [store chain caps]
-  (if (nil? chain)
-    #?(:clj (constantly true) :cljs (js/Promise.resolve (constantly true)))
-    (then* (eng/hot-datoms (:get-fn store) chain
-                           {:index :eavt :components [policy/policy-entity]}
-                           (constantly true) crypto/blind-fn crypto/decrypt-fn)
-           (fn [rows] (policy/visible-for (policy/policy-of rows) caps)))))
+  "The per-request `visible?` row filter (ADR-2607174500). ONE narrow read
+  of the graph's in-chain policy entity, combined with the viewer's
+  VERIFIED CACAO capability resources AND (Phase 3c) the entity ids the
+  viewer OWNS per the policy's :owner-attrs. A policy-less graph yields
+  (constantly true). `viewer` is the auth map {:did :resources} or nil.
+  Promise on cljs."
+  [store chain viewer]
+  (let [caps (:resources viewer)
+        viewer-did (:did viewer)]
+    (if (nil? chain)
+      #?(:clj (constantly true) :cljs (js/Promise.resolve (constantly true)))
+      (then* (eng/hot-datoms (:get-fn store) chain
+                             {:index :eavt :components [policy/policy-entity]}
+                             (constantly true) crypto/blind-fn crypto/decrypt-fn)
+             (fn [rows]
+               (let [policy (policy/policy-of rows)]
+                 (then* (owned-entities store chain policy viewer-did)
+                        (fn [owned] (policy/visible-for policy caps owned)))))))))
 
 (defn do-datoms
   "`datomic.datoms` — filtered read via hot-datoms (snapshot + novelty merge,
@@ -134,9 +168,9 @@
   plaintext-passthrough profile (`kotobase.cljc-worker.crypto`,
   ADR-2607051000 adoption) — on cljs the response is a `js/Promise`."
   ([store body] (do-datoms store body nil))
-  ([store {:keys [graph index components_edn limit]} caps]
+  ([store {:keys [graph index components_edn limit]} viewer]
    (let [chain ((:head-get store) graph)]
-     (then* (request-visible? store chain caps)
+     (then* (request-visible? store chain viewer)
             (fn [visible?]
               (then* (eng/hot-datoms (:get-fn store) chain
                                      {:index (or (index-kw index) :eavt)
@@ -196,10 +230,10 @@
   `(constantly true)` explicitly: today's behavior is unchanged (every
   matching quad visible), stated instead of assumed."
   ([store body] (do-q store body nil))
-  ([store {:keys [graph query_edn]} caps]
+  ([store {:keys [graph query_edn]} viewer]
    (let [chain ((:head-get store) graph)
          pat   (edn/read-string query_edn)]
-     (then* (request-visible? store chain caps)
+     (then* (request-visible? store chain viewer)
            (fn [visible?]
              (then* (hot-db (:get-fn store) chain)
                     (fn [db] {:ok true :graph graph :rows (vec (eng/q db pat visible?))})))))))
@@ -211,9 +245,9 @@
   Same `(constantly true)` `visible?` convention as `do-datoms`/`hot-db`,
   above (ADR-2607050500 Phase 3 redaction not wired in yet)."
   ([store body] (do-pull store body nil))
-  ([store {:keys [graph entity]} caps]
+  ([store {:keys [graph entity]} viewer]
    (let [chain ((:head-get store) graph)]
-     (then* (request-visible? store chain caps)
+     (then* (request-visible? store chain viewer)
             (fn [visible?]
               (then* (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
                                      visible? crypto/blind-fn crypto/decrypt-fn)
@@ -305,9 +339,9 @@
   `{:ok false :error \"ViewNotFound\"}` when the view was never
   materialized for this graph."
   ([store body] (do-view store body nil))
-  ([store {:keys [graph view]} caps]
+  ([store {:keys [graph view]} viewer]
    (let [chain ((:head-get store) graph)]
-     (then* (request-visible? store chain caps)
+     (then* (request-visible? store chain viewer)
             (fn [visible?]
               (then* (eng/view-rows (:get-fn store) chain view visible? crypto/decrypt-fn)
                      (fn [res]
@@ -426,13 +460,13 @@
                            :cljs (or (ex-message e) (.-message e)))}))]
     (try
       (let [auth-did (if (map? auth) (:did auth) auth)
-            caps (when (map? auth) (:resources auth))
+            viewer (when (map? auth) auth)
             resp (case method
-                   "datoms"   (do-datoms store body caps)
+                   "datoms"   (do-datoms store body viewer)
                    "transact" (do-transact store body auth-did)
-                   "q"        (do-q store body caps)
-                   "pull"     (do-pull store body caps)
-                   "view"     (do-view store body caps)
+                   "q"        (do-q store body viewer)
+                   "pull"     (do-pull store body viewer)
+                   "view"     (do-view store body viewer)
                    "fold"     (do-fold store body)
                    "diagHydrateCost" (do-diag-hydrate-cost store body)
                    "diagCommitCost" (do-diag-commit-cost store body)
