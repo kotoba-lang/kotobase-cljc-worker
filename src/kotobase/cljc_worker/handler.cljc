@@ -41,6 +41,7 @@
             [clojure.string :as str]
             [kotobase.cljc-worker.crypto :as crypto]
             [kotobase-peer.core :as eng]
+            [kotobase-peer.policy :as policy]
             [ipld.core :as ipld]
             [prolly-tree.core :as pt]
             [arrangement.core :as qs]))
@@ -106,6 +107,20 @@
 (defn- index-kw [index]
   (when (seq index) (keyword (cond-> index (str/starts-with? index ":") (subs 1)))))
 
+(defn- request-visible?
+  "The per-request `visible?` row filter (ADR-2607174500 = ADR-2607050500
+  Phase 3): ONE narrow entity read of the graph's in-chain policy entity,
+  combined with the viewer's VERIFIED CACAO capability resources. A graph
+  with no policy entity yields (constantly true) — fully public, exactly
+  the pre-Phase-3 behavior. Promise on cljs (hot-datoms' platform split)."
+  [store chain caps]
+  (if (nil? chain)
+    #?(:clj (constantly true) :cljs (js/Promise.resolve (constantly true)))
+    (then* (eng/hot-datoms (:get-fn store) chain
+                           {:index :eavt :components [policy/policy-entity]}
+                           (constantly true) crypto/blind-fn crypto/decrypt-fn)
+           (fn [rows] (policy/visible-for (policy/policy-of rows) caps)))))
+
 (defn do-datoms
   "`datomic.datoms` — filtered read via hot-datoms (snapshot + novelty merge,
   range-pruned on the snapshot side; never a whole-graph rehydrate). body:
@@ -118,14 +133,17 @@
   stated instead of assumed. `blind-fn`/`decrypt-fn` are the explicit
   plaintext-passthrough profile (`kotobase.cljc-worker.crypto`,
   ADR-2607051000 adoption) — on cljs the response is a `js/Promise`."
-  [store {:keys [graph index components_edn limit]}]
-  (let [chain ((:head-get store) graph)]
-    (then* (eng/hot-datoms (:get-fn store) chain
-                           {:index (or (index-kw index) :eavt)
-                            :components (vec components_edn)
-                            :limit limit}
-                           (constantly true) crypto/blind-fn crypto/decrypt-fn)
-           (fn [rows] {:ok true :graph graph :datoms (vec rows)}))))
+  ([store body] (do-datoms store body nil))
+  ([store {:keys [graph index components_edn limit]} caps]
+   (let [chain ((:head-get store) graph)]
+     (then* (request-visible? store chain caps)
+            (fn [visible?]
+              (then* (eng/hot-datoms (:get-fn store) chain
+                                     {:index (or (index-kw index) :eavt)
+                                      :components (vec components_edn)
+                                      :limit limit}
+                                     visible? crypto/blind-fn crypto/decrypt-fn)
+                     (fn [rows] {:ok true :graph graph :datoms (vec rows)})))))))
 
 (defn do-transact
   "`datomic.transact` — append the tx quads as ONE novelty block and advance
@@ -177,11 +195,14 @@
   in yet (tracked as ADR-2607050500 Phase 3, not done here), so it passes
   `(constantly true)` explicitly: today's behavior is unchanged (every
   matching quad visible), stated instead of assumed."
-  [store {:keys [graph query_edn]}]
-  (let [chain ((:head-get store) graph)
-        pat   (edn/read-string query_edn)]
-    (then* (hot-db (:get-fn store) chain)
-           (fn [db] {:ok true :graph graph :rows (vec (eng/q db pat (constantly true)))}))))
+  ([store body] (do-q store body nil))
+  ([store {:keys [graph query_edn]} caps]
+   (let [chain ((:head-get store) graph)
+         pat   (edn/read-string query_edn)]
+     (then* (request-visible? store chain caps)
+           (fn [visible?]
+             (then* (hot-db (:get-fn store) chain)
+                    (fn [db] {:ok true :graph graph :rows (vec (eng/q db pat visible?))})))))))
 
 (defn do-pull
   "`datomic.pull` — all attrs of one entity, via hot-datoms (snapshot +
@@ -189,13 +210,16 @@
 
   Same `(constantly true)` `visible?` convention as `do-datoms`/`hot-db`,
   above (ADR-2607050500 Phase 3 redaction not wired in yet)."
-  [store {:keys [graph entity]}]
-  (let [chain ((:head-get store) graph)]
-    (then* (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
-                           (constantly true) crypto/blind-fn crypto/decrypt-fn)
-           (fn [rows]
-             {:ok true :graph graph :entity entity
-              :attrs (reduce (fn [m {:keys [a v_edn]}] (update m a (fnil conj []) v_edn)) {} rows)}))))
+  ([store body] (do-pull store body nil))
+  ([store {:keys [graph entity]} caps]
+   (let [chain ((:head-get store) graph)]
+     (then* (request-visible? store chain caps)
+            (fn [visible?]
+              (then* (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
+                                     visible? crypto/blind-fn crypto/decrypt-fn)
+                     (fn [rows]
+                       {:ok true :graph graph :entity entity
+                        :attrs (reduce (fn [m {:keys [a v_edn]}] (update m a (fnil conj []) v_edn)) {} rows)})))))))
 
 (defn do-fold
   "`datomic.fold` — compacts a graph's accumulated novelty into a fresh
@@ -280,14 +304,17 @@
   do-datoms (`:datoms` rows) so existing row consumers work unchanged;
   `{:ok false :error \"ViewNotFound\"}` when the view was never
   materialized for this graph."
-  [store {:keys [graph view]}]
-  (let [chain ((:head-get store) graph)]
-    (then* (eng/view-rows (:get-fn store) chain view (constantly true) crypto/decrypt-fn)
-           (fn [res]
-             (if res
-               {:ok true :graph graph :view view :spec (:spec res)
-                :datoms (vec (:rows res))}
-               {:ok false :error "ViewNotFound" :graph graph :view view})))))
+  ([store body] (do-view store body nil))
+  ([store {:keys [graph view]} caps]
+   (let [chain ((:head-get store) graph)]
+     (then* (request-visible? store chain caps)
+            (fn [visible?]
+              (then* (eng/view-rows (:get-fn store) chain view visible? crypto/decrypt-fn)
+                     (fn [res]
+                       (if res
+                         {:ok true :graph graph :view view :spec (:spec res)
+                          :datoms (vec (:rows res))}
+                         {:ok false :error "ViewNotFound" :graph graph :view view}))))))))
 
 (defn do-diag-hydrate-cost
   "Read-only diagnostic (NOT part of the datomic surface, no write, no fold,
@@ -386,7 +413,7 @@
   `ai.gftd.apps.kotobase.datomic.`; `body` is the keywordized JSON body;
   `auth-did` is the CACAO-verified issuer or nil. Returns a plain response map;
   never throws for a known method (errors become `{:ok false :error …}`)."
-  [store method body auth-did]
+  [store method body auth]
   (letfn [(err [e]
             ;; the R2 trampoline's cache-miss must propagate to with-blocks,
             ;; NOT be swallowed here — re-throw it (on cljs: rejecting the
@@ -398,12 +425,14 @@
                :message #?(:clj (.getMessage ^Exception e)
                            :cljs (or (ex-message e) (.-message e)))}))]
     (try
-      (let [resp (case method
-                   "datoms"   (do-datoms store body)
+      (let [auth-did (if (map? auth) (:did auth) auth)
+            caps (when (map? auth) (:resources auth))
+            resp (case method
+                   "datoms"   (do-datoms store body caps)
                    "transact" (do-transact store body auth-did)
-                   "q"        (do-q store body)
-                   "pull"     (do-pull store body)
-                   "view"     (do-view store body)
+                   "q"        (do-q store body caps)
+                   "pull"     (do-pull store body caps)
+                   "view"     (do-view store body caps)
                    "fold"     (do-fold store body)
                    "diagHydrateCost" (do-diag-hydrate-cost store body)
                    "diagCommitCost" (do-diag-commit-cost store body)
