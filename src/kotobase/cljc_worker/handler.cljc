@@ -126,7 +126,8 @@
                (mapcat (fn [attr]
                          (->> (eng/hot-datoms (:get-fn store) chain
                                               {:index :avet :components [attr viewer-did]}
-                                              (constantly true) (blind-of store) (decrypt-of store))
+                                              (constantly true) (blind-of store) (decrypt-of store)
+                                              (:async-get-fn store))
                               (map :e))))
                owner-attrs)
          :cljs
@@ -135,7 +136,8 @@
                (map (fn [attr]
                       (eng/hot-datoms (:get-fn store) chain
                                       {:index :avet :components [attr viewer-did]}
-                                      (constantly true) (blind-of store) (decrypt-of store)))
+                                      (constantly true) (blind-of store) (decrypt-of store)
+                                      (:async-get-fn store)))
                     owner-attrs)))
              (.then (fn [^js lists]
                       (into #{} (mapcat #(map :e %)) (array-seq lists)))))))))
@@ -155,7 +157,8 @@
         #?(:clj visible? :cljs (js/Promise.resolve visible?)))
       (then* (eng/hot-datoms (:get-fn store) chain
                              {:index :eavt :components [policy/policy-entity]}
-                             (constantly true) (blind-of store) (decrypt-of store))
+                             (constantly true) (blind-of store) (decrypt-of store)
+                             (:async-get-fn store))
              (fn [rows]
                (let [policy (policy/policy-of rows)]
                  (then* (owned-entities store chain policy viewer-did)
@@ -184,7 +187,8 @@
                                      {:index (or (index-kw index) :eavt)
                                       :components (vec components_edn)
                                       :limit limit}
-                                     visible? (blind-of store) (decrypt-of store))
+                                     visible? (blind-of store) (decrypt-of store)
+                                     (:async-get-fn store))
                      (fn [rows] (merge {:ok true :graph graph :datoms (vec rows)}
                                        (policy/visibility-evidence visible?)))))))))
 
@@ -210,7 +214,8 @@
         policy-rows (if prev-chain
                       (eng/hot-datoms get-fn prev-chain
                                       {:index :eavt :components [policy/policy-entity]}
-                                      (constantly true) (blind-of store) (decrypt-of store))
+                                      (constantly true) (blind-of store) (decrypt-of store)
+                                      (:async-get-fn store))
                       #?(:clj [] :cljs (js/Promise.resolve [])))]
     (then* policy-rows
            (fn [rows]
@@ -348,7 +353,8 @@
         policy-rows (if prev-chain
                       (eng/hot-datoms get-fn prev-chain
                                       {:index :eavt :components [policy/policy-entity]}
-                                      (constantly true) (blind-of store) (decrypt-of store))
+                                      (constantly true) (blind-of store) (decrypt-of store)
+                                      (:async-get-fn store))
                       #?(:clj [] :cljs (js/Promise.resolve [])))]
     (then* policy-rows
            (fn [rows]
@@ -402,8 +408,8 @@
   `do-q`'s own `eng/q` call, below, for why: no capability/purpose-scoped
   redaction is wired into this handler yet, ADR-2607050500 Phase 3)."
   [store chain]
-  (then* (eng/hot-datoms (:get-fn store) chain (constantly true)
-                         (blind-of store) (decrypt-of store))
+  (then* (eng/hot-datoms (:get-fn store) chain nil (constantly true)
+                         (blind-of store) (decrypt-of store) (:async-get-fn store))
          (fn [rows]
            (eng/transact (eng/empty-db)
                          (map (fn [{:keys [e a v_edn]}] {:s e :p a :o (edn/read-string v_edn)})
@@ -443,7 +449,8 @@
      (then* (request-visible? store chain viewer)
             (fn [visible?]
               (then* (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
-                                     visible? (blind-of store) (decrypt-of store))
+                                     visible? (blind-of store) (decrypt-of store)
+                                     (:async-get-fn store))
                      (fn [rows]
                        (merge {:ok true :graph graph :entity entity
                                :attrs (reduce (fn [m {:keys [a v_edn]}]
