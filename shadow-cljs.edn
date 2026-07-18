@@ -5,21 +5,7 @@
 ;; The engine dep chain is consumed as shadow-cljs source-paths from the west
 ;; checkout (same pattern app-aozora uses for kotobase-client/atproto/mst),
 ;; relative to orgs/kotoba-lang/kotobase-cljc-worker → orgs/kotoba-lang/<dep>.
-{:source-paths
- ["src" "test"
-  ;; kotobase-engine -> kotobase-peer, quad-store+kqe -> arrangement
-  ;; (ADR-2607050700); commit-dag -> chain (ADR-2607050800)
-  "../kotobase-peer/src"
-  "../datom/src"          ; canonical datom model (datom.core), consumed by the peer library
-  "../arrangement/src"
-  "../prolly-tree/src"
-  "../chain/src"
-  "../io-ipld/src"
-  "../io-multiformats/src"
-  "../org-ietf-cbor/src" ; renamed from dag-cbor 2026-07-06
-  ;; byte-exact CACAO verify + canonical-graph
-  "../kotobase-client/src"]
-
+{:deps {:aliases [:cljs]}
  :dependencies []
 
  :builds

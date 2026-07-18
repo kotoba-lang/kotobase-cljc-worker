@@ -39,7 +39,7 @@
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
             [clojure.string :as str]
-            [kotobase.cljc-worker.crypto :as crypto]
+            [kotobase.server.security.crypto :as crypto]
             [kotobase-peer.core :as eng]
             [kotobase-peer.policy :as policy]
             [ipld.core :as ipld]
@@ -47,6 +47,10 @@
             [arrangement.core :as qs]))
 
 (def datomic-ns "ai.gftd.apps.kotobase.datomic")
+
+(defn- blind-of [store] (or (:blind-fn store) crypto/blind-fn))
+(defn- encrypt-of [store] (or (:encrypt-fn store) crypto/encrypt-fn))
+(defn- decrypt-of [store] (or (:decrypt-fn store) crypto/decrypt-fn))
 
 (defn- then*
   "Thread `x` through `f` across the engine's platform split (ADR-2607051000:
@@ -121,7 +125,7 @@
                (mapcat (fn [attr]
                          (->> (eng/hot-datoms (:get-fn store) chain
                                               {:index :avet :components [attr viewer-did]}
-                                              (constantly true) crypto/blind-fn crypto/decrypt-fn)
+                                              (constantly true) (blind-of store) (decrypt-of store))
                               (map :e))))
                owner-attrs)
          :cljs
@@ -130,7 +134,7 @@
                (map (fn [attr]
                       (eng/hot-datoms (:get-fn store) chain
                                       {:index :avet :components [attr viewer-did]}
-                                      (constantly true) crypto/blind-fn crypto/decrypt-fn))
+                                      (constantly true) (blind-of store) (decrypt-of store)))
                     owner-attrs)))
              (.then (fn [^js lists]
                       (into #{} (mapcat #(map :e %)) (array-seq lists)))))))))
@@ -146,14 +150,17 @@
   (let [caps (:resources viewer)
         viewer-did (:did viewer)]
     (if (nil? chain)
-      #?(:clj (constantly true) :cljs (js/Promise.resolve (constantly true)))
+      (let [visible? (policy/visible-for-mode nil caps #{} (:security-mode store))]
+        #?(:clj visible? :cljs (js/Promise.resolve visible?)))
       (then* (eng/hot-datoms (:get-fn store) chain
                              {:index :eavt :components [policy/policy-entity]}
-                             (constantly true) crypto/blind-fn crypto/decrypt-fn)
+                             (constantly true) (blind-of store) (decrypt-of store))
              (fn [rows]
                (let [policy (policy/policy-of rows)]
                  (then* (owned-entities store chain policy viewer-did)
-                        (fn [owned] (policy/visible-for policy caps owned)))))))))
+                        (fn [owned]
+                          (policy/visible-for-mode policy caps owned
+                                                   (:security-mode store))))))))))
 
 (defn do-datoms
   "`datomic.datoms` — filtered read via hot-datoms (snapshot + novelty merge,
@@ -165,7 +172,7 @@
   scoped redaction wired in yet (ADR-2607050500 Phase 3, not done here), so
   it passes `(constantly true)` explicitly: today's behavior is unchanged,
   stated instead of assumed. `blind-fn`/`decrypt-fn` are the explicit
-  plaintext-passthrough profile (`kotobase.cljc-worker.crypto`,
+  plaintext-passthrough profile (`kotobase.server.security.crypto`,
   ADR-2607051000 adoption) — on cljs the response is a `js/Promise`."
   ([store body] (do-datoms store body nil))
   ([store {:keys [graph index components_edn limit]} viewer]
@@ -176,8 +183,9 @@
                                      {:index (or (index-kw index) :eavt)
                                       :components (vec components_edn)
                                       :limit limit}
-                                     visible? crypto/blind-fn crypto/decrypt-fn)
-                     (fn [rows] {:ok true :graph graph :datoms (vec rows)})))))))
+                                     visible? (blind-of store) (decrypt-of store))
+                     (fn [rows] (merge {:ok true :graph graph :datoms (vec rows)}
+                                       (policy/visibility-evidence visible?)))))))))
 
 (defn do-transact
   "`datomic.transact` — append the tx quads as ONE novelty block and advance
@@ -188,16 +196,31 @@
   owner); nil here means the shell already gated it. `novelty_size` in the
   response is an observability signal for when a `fold` (see `do-fold`) is
   worth invoking — this handler never folds itself."
-  [store {:keys [graph tx_edn]} _auth-did]
+  [store {:keys [graph tx_edn]} auth]
   (let [get-fn (:get-fn store)
         prev-chain ((:head-get store) graph)
-        quads (tx-edn->quads tx_edn)]
-    (then* (eng/commit! (:put! store) get-fn quads prev-chain crypto/encrypt-fn)
-           (fn [chain]
-             ((:head-put! store) graph chain)
-             {:ok true :graph graph :commit chain
-              :datom_count (count quads)
-              :novelty_size (eng/novelty-size get-fn chain)}))))
+        quads (vec (tx-edn->quads tx_edn))
+        context (if (map? auth)
+                  auth
+                  ;; Trusted embedded/test compatibility only. The network
+                  ;; worker always supplies the strict verifier's auth map.
+                  {:did auth :effective-caps #{policy/transact-capability
+                                               policy/policy-admin-capability}})
+        policy-rows (if prev-chain
+                      (eng/hot-datoms get-fn prev-chain
+                                      {:index :eavt :components [policy/policy-entity]}
+                                      (constantly true) (blind-of store) (decrypt-of store))
+                      #?(:clj [] :cljs (js/Promise.resolve [])))]
+    (then* policy-rows
+           (fn [rows]
+             (policy/assert-write-authorized!
+              (policy/policy-of rows) context quads (:security-mode store))
+             (then* (eng/commit! (:put! store) get-fn quads prev-chain (encrypt-of store))
+                    (fn [chain]
+                      ((:head-put! store) graph chain)
+                      {:ok true :graph graph :commit chain :previous_commit prev-chain
+                       :datom_count (count quads)
+                       :novelty_size (eng/novelty-size get-fn chain)}))))))
 
 (defn- hot-db
   "The full hot db as of `chain` (snapshot + novelty merged) — for `do-q`,
@@ -209,9 +232,9 @@
   Passes `(constantly true)` for `hot-datoms`'s required `visible?` (see
   `do-q`'s own `eng/q` call, below, for why: no capability/purpose-scoped
   redaction is wired into this handler yet, ADR-2607050500 Phase 3)."
-  [get-fn chain]
-  (then* (eng/hot-datoms get-fn chain (constantly true)
-                         crypto/blind-fn crypto/decrypt-fn)
+  [store chain]
+  (then* (eng/hot-datoms (:get-fn store) chain (constantly true)
+                         (blind-of store) (decrypt-of store))
          (fn [rows]
            (eng/transact (eng/empty-db)
                          (map (fn [{:keys [e a v_edn]}] {:s e :p a :o (edn/read-string v_edn)})
@@ -235,8 +258,9 @@
          pat   (edn/read-string query_edn)]
      (then* (request-visible? store chain viewer)
            (fn [visible?]
-             (then* (hot-db (:get-fn store) chain)
-                    (fn [db] {:ok true :graph graph :rows (vec (eng/q db pat visible?))})))))))
+             (then* (hot-db store chain)
+                    (fn [db] (merge {:ok true :graph graph :rows (vec (eng/q db pat visible?))}
+                                    (policy/visibility-evidence visible?)))))))))
 
 (defn do-pull
   "`datomic.pull` — all attrs of one entity, via hot-datoms (snapshot +
@@ -250,10 +274,12 @@
      (then* (request-visible? store chain viewer)
             (fn [visible?]
               (then* (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
-                                     visible? crypto/blind-fn crypto/decrypt-fn)
+                                     visible? (blind-of store) (decrypt-of store))
                      (fn [rows]
-                       {:ok true :graph graph :entity entity
-                        :attrs (reduce (fn [m {:keys [a v_edn]}] (update m a (fnil conj []) v_edn)) {} rows)})))))))
+                       (merge {:ok true :graph graph :entity entity
+                               :attrs (reduce (fn [m {:keys [a v_edn]}]
+                                                (update m a (fnil conj []) v_edn)) {} rows)}
+                              (policy/visibility-evidence visible?)))))))))
 
 (defn do-fold
   "`datomic.fold` — compacts a graph's accumulated novelty into a fresh
@@ -322,12 +348,13 @@
     (if (and (zero? novelty-n) (or (nil? views) (nil? chain)))
       {:ok true :graph graph :folded false}
       (then* (eng/fold! (:put! store) get-fn chain ipld/link? max-novelty
-                        crypto/blind-fn crypto/encrypt-fn crypto/decrypt-fn
+                        (blind-of store) (encrypt-of store) (decrypt-of store)
                         (:cache-get store) (:cache-put! store) (:async-get-fn store)
                         views)
              (fn [new-chain]
                ((:head-put! store) graph new-chain)
                {:ok true :graph graph :folded true :commit new-chain
+                :previous_commit chain
                 :novelty_folded (if max-novelty (min max-novelty novelty-n) novelty-n)
                 :novelty_remaining (if max-novelty (max 0 (- novelty-n max-novelty)) 0)})))))
 
@@ -343,12 +370,14 @@
    (let [chain ((:head-get store) graph)]
      (then* (request-visible? store chain viewer)
             (fn [visible?]
-              (then* (eng/view-rows (:get-fn store) chain view visible? crypto/decrypt-fn)
+              (then* (eng/view-rows (:get-fn store) chain view visible? (decrypt-of store))
                      (fn [res]
-                       (if res
-                         {:ok true :graph graph :view view :spec (:spec res)
-                          :datoms (vec (:rows res))}
-                         {:ok false :error "ViewNotFound" :graph graph :view view}))))))))
+                       (merge
+                        (if res
+                          {:ok true :graph graph :view view :spec (:spec res)
+                           :datoms (vec (:rows res))}
+                          {:ok false :error "ViewNotFound" :graph graph :view view})
+                        (policy/visibility-evidence visible?)))))))))
 
 (defn do-diag-hydrate-cost
   "Read-only diagnostic (NOT part of the datomic surface, no write, no fold,
@@ -430,10 +459,10 @@
        (if (nil? chain)
          (js/Promise.resolve {:ok true :graph graph :hydrate_ms 0 :commit_ms 0})
          (let [t0 (js/Date.now)]
-           (-> (eng/hydrate-db-cached get-fn snap crypto/blind-fn crypto/decrypt-fn nil nil async-get-fn)
+           (-> (eng/hydrate-db-cached get-fn snap (blind-of store) (decrypt-of store) nil nil async-get-fn)
                (.then (fn [db]
                         (let [t1 (js/Date.now)]
-                          (-> (qs/commit! put! db nil qs/current-schema-version crypto/blind-fn crypto/encrypt-fn)
+                          (-> (qs/commit! put! db nil qs/current-schema-version (blind-of store) (encrypt-of store))
                               (.then (fn [_new-snap-cid]
                                        (let [t2 (js/Date.now)]
                                          {:ok true :graph graph :snapshot snap
@@ -453,17 +482,20 @@
             ;; NOT be swallowed here — re-throw it (on cljs: rejecting the
             ;; response promise, which with-blocks' .catch trampolines); only
             ;; real errors become InternalError.
-            (if (:block-miss (ex-data e))
-              (throw e)
-              {:ok false :error "InternalError"
-               :message #?(:clj (.getMessage ^Exception e)
-                           :cljs (or (ex-message e) (.-message e)))}))]
+            (let [data (ex-data e)]
+              (cond
+                (:block-miss data) (throw e)
+                (= :kotobase.policy/write-denied (:type data))
+                {:ok false :error "AccessDenied"
+                 :reason (some-> data :decision :denials first :reason name)}
+                :else {:ok false :error "InternalError"
+                       :message #?(:clj (.getMessage ^Exception e)
+                                   :cljs (or (ex-message e) (.-message e)))})))]
     (try
-      (let [auth-did (if (map? auth) (:did auth) auth)
-            viewer (when (map? auth) auth)
+      (let [viewer (when (map? auth) auth)
             resp (case method
                    "datoms"   (do-datoms store body viewer)
-                   "transact" (do-transact store body auth-did)
+                   "transact" (do-transact store body auth)
                    "q"        (do-q store body viewer)
                    "pull"     (do-pull store body viewer)
                    "view"     (do-view store body viewer)

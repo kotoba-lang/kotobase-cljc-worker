@@ -39,7 +39,11 @@
    (deftest datoms-on-empty-graph
      (async done
        (-> (h/do-datoms (mem-store) {:graph g :index ":eavt"})
-           (.then (fn [r] (is (= {:ok true :graph g :datoms []} r)) (done)))
+           (.then (fn [r]
+                    (is (= {:ok true :graph g :datoms []}
+                           (select-keys r [:ok :graph :datoms])))
+                    (is (= :legacy-public (:policy-reason r)))
+                    (done)))
            (.catch (fn [e] (is false (str "rejected: " e)) (done)))))))
 
 #?(:cljs

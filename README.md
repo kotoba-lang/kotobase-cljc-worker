@@ -1,5 +1,11 @@
 # kotobase-cljc-worker
 
+> **Deployment retired / migration source only.** New externally reachable
+> Cloudflare Workers belong to `gftdcojp/net-kotobase`. Reusable runtime and
+> security code is being extracted to `kotoba-lang/kotobase-server`; this repo
+> accepts only migration, compatibility, and extraction changes until archive.
+> Its checked-in Wrangler manifest has no route and disables `workers.dev`.
+
 Filter-honoring CLJC replacement for the deleted-source WASM kotobase datom
 worker. The WASM worker **ignored `index` / `components_edn` / `limit`** and
 rehydrated + serialised the WHOLE graph on every `datomic.datoms` read — the
@@ -83,6 +89,10 @@ npm test                       # handler + trampoline (node)
 npx shadow-cljs release worker # → out/worker.js (:esm)
 ```
 
+Private/sealed promotion additionally requires the six-part operational
+evidence in [docs/security-production-readiness.md](docs/security-production-readiness.md).
+Configured binding names and implementation tests alone are not S2–S5 evidence.
+
 ## Deploy — GATED on the yoro-social migration (do NOT flip the route blindly)
 
 The CLJC prolly/chain block format is **incompatible** with the live Rust
@@ -110,10 +120,11 @@ the difference between "under the ceiling" (this worker) and "fast".
 
 **A SECOND, independent migration gate**, layered on top of the one above
 (that one moved WASM→CLJC; this one moves plaintext→encrypted-seam within
-CLJC). `main` (`f9454dbf`) adopts ADR-2607051000's `blind-fn`/`encrypt-fn`/
-`decrypt-fn` seam (an explicit plaintext-passthrough profile today,
-`kotobase.cljc-worker.crypto` — real per-graph keys are still that ADR's own
-follow-up), which is REQUIRED to even call the current `kotobase-peer` API
+CLJC). `main` (`f9454dbf`) introduced ADR-2607051000's `blind-fn`/`encrypt-fn`/
+`decrypt-fn` seam. Current source also implements a private/sealed versioned
+keyring and AEAD profile, while the checked-in deployment remains
+`legacy-public`; promotion is gated by the operational evidence above. The seam
+is REQUIRED to call the current `kotobase-peer` API
 (deploying without it is the "Invalid arity: 4" crash, confirmed live). But
 adopting it also changes the novelty-tx-block wire shape to `{"ct": ...}`
 (`kotobase-peer.core/put-tx-block!`), which has **no backward-compat reader**

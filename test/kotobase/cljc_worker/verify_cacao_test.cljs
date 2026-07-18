@@ -12,6 +12,20 @@
             ["@noble/curves/ed25519.js" :refer [ed25519]]))
 
 (def seed (js/Uint8Array.from (clj->js (range 32))))
+(def root-seed (js/Uint8Array.from (clj->js (range 32 64))))
+
+(defn- delegation-grant [audience resources]
+  (let [now (.getTime (js/Date.))
+        p {:domain "kotobase.net"
+           :iss (cid/did-key-from-ed25519-pub (.getPublicKey ed25519 root-seed))
+           :aud audience :version "1" :nonce "delegate-1"
+           :iat (.toISOString (js/Date. (- now 1000)))
+           :exp (.toISOString (js/Date. (+ now 300000)))
+           :statement nil :resources resources}
+        sig (.sign ed25519 (cid/text->bytes (cacao/cacao-siwe-message p)) root-seed)]
+    (cacao/bytes->base64
+     (.encode dag-cbor #js {:h #js {:t "caip122"} :p (clj->js p)
+                           :s #js {:t "EdDSA" :s (cacao/bytes->base64url sig)}}))))
 
 (defn- mint-with-exp
   "Like kotobase.cacao/mint-cacao, but with an explicit (possibly
@@ -53,3 +67,73 @@
   (testing "absent :exp means no expiry check at all -- this fn's existing,
             documented 'expiry-if-present' scope, unaffected by the fix"
     (is (string? (w/verify-cacao (mint-with-exp nil))))))
+
+(defn- strict-token
+  [opts]
+  (:cacao-b64
+   (cacao/mint-cacao
+    (merge {:secret-key seed :aud "did:web:kotobase.aozora.app"
+            :capability "datom:read" :graph "g" :ttl-sec 300}
+           opts))))
+
+(def strict-opts
+  {:audience "did:web:kotobase.aozora.app" :graph "g"
+   :operation :datom/read :required-capabilities #{"datom:read"}
+   :privileged-capabilities #{"datom:read-protected"}})
+
+(deftest strict-context-binds-audience-graph-and-operation-capability
+  (is (map? (w/verify-cacao-context (strict-token {}) strict-opts)))
+  (is (nil? (w/verify-cacao-context (strict-token {})
+                                    (assoc strict-opts :audience "did:web:evil.example"))))
+  (is (nil? (w/verify-cacao-context (strict-token {})
+                                    (assoc strict-opts :graph "other"))))
+  (is (nil? (w/verify-cacao-context (strict-token {})
+                                    (assoc strict-opts
+                                           :required-capabilities #{"datom:transact"})))))
+
+(deftest strict-context-requires-expiry
+  (is (nil? (w/verify-cacao-context (mint-with-exp nil) strict-opts))))
+
+(deftest self-asserted-privileged-capability-is-attenuated
+  (let [token (strict-token {:extra-capabilities ["datom:read-protected"]})
+        untrusted (w/verify-cacao-context token strict-opts)
+        issuer (:principal-did untrusted)
+        trusted (w/verify-cacao-context token
+                                        (assoc strict-opts :privileged-dids #{issuer}))]
+    (is (not (contains? (:effective-caps untrusted)
+                        "kotoba://can/datom:read-protected")))
+    (is (contains? (:effective-caps trusted)
+                   "kotoba://can/datom:read-protected"))))
+
+(deftest strict-context-rejects-revoked-issuer-and-unknown-capability
+  (let [normal (strict-token {})
+        issuer (:principal-did (w/verify-cacao-context normal strict-opts))
+        unknown (strict-token {:extra-capabilities ["datom:root-everything"]})]
+    (is (nil? (w/verify-cacao-context normal
+                                      (assoc strict-opts :revoked-dids #{issuer}))))
+    (is (nil? (w/verify-cacao-context unknown strict-opts)))))
+
+(deftest strict-context-accepts-privileged-capability-only-through-trusted-delegation
+  (let [token (strict-token {:extra-capabilities ["datom:read-protected"]})
+        principal (:did (w/verify-cacao-full token))
+        root (cid/did-key-from-ed25519-pub (.getPublicKey ed25519 root-seed))
+        resources ["kotoba://graph/g" "kotoba://can/datom:read"
+                   "kotoba://can/datom:read-protected"]
+        grant (delegation-grant principal resources)
+        ctx (w/verify-cacao-context
+             token (assoc strict-opts :delegations-b64 [grant]
+                          :trusted-root-dids #{root}))]
+    (is (:delegated? ctx))
+    (is (= root (:authority-root ctx)))
+    (is (contains? (:effective-caps ctx) "kotoba://can/datom:read-protected"))
+    (is (nil? (w/verify-cacao-context
+               token (assoc strict-opts :delegations-b64 [grant]
+                            :trusted-root-dids #{"did:key:not-root"}))))))
+
+(deftest strict-context-binds-private-credential-to-tenant
+  (let [token-a (strict-token {:tenant "tenant-a"})
+        opts (assoc strict-opts :tenant-id "tenant-a" :require-tenant-binding? true)]
+    (is (map? (w/verify-cacao-context token-a opts)))
+    (is (nil? (w/verify-cacao-context
+               token-a (assoc opts :tenant-id "tenant-b"))))
+    (is (nil? (w/verify-cacao-context (strict-token {}) opts)))))
