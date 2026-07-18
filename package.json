@@ -7,5 +7,8 @@
     "@noble/hashes": "^1.8.0",
     "shadow-cljs": "^2.28.20"
   },
-  "scripts": { "test": "shadow-cljs compile test && node out/node-tests.js" }
+  "scripts": {
+    "test": "shadow-cljs compile test && node out/node-tests.js",
+    "deploy": "node -e \"throw new Error('migration-only repository; public deploy owner is gftdcojp/net-kotobase')\""
+  }
 }

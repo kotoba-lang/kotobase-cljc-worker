@@ -11,10 +11,8 @@
   "main": "out/worker.js",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
-  "workers_dev": true,
-  "routes": [
-    { "pattern": "kotobase.aozora.app", "custom_domain": true }
-  ],
+  "workers_dev": false,
+  "routes": [],
   // Raised from the (unset) plan default so a one-time catch-up `fold` can
   // synchronously decode/merge yoro-social-v2's mass-write novelty backlog
   // (ADR-2607110200 addendum, 2026-07-10: reads AND folds were hitting
