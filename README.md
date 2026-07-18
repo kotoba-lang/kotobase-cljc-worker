@@ -1,4 +1,20 @@
-# kotobase-cljc-worker
+# kotobase-cljc-worker (archived)
+
+This repository is retired. It no longer contains a deployable Worker or the
+authoritative migration implementation.
+
+The historical CLJC Worker v2/v3 source, tests, recovery configuration and
+parity fixtures moved to:
+
+`gftdcojp/net-kotobase/migrations/cljc-worker-v2-v3`
+
+Reusable database, crypto and capability code remains in focused
+`kotoba-lang` libraries. Public runtime, storage, keys, migrations, rollback
+and operational receipts are owned by `gftdcojp/net-kotobase`.
+
+Do not recreate routes, bindings, secrets or deployment workflows here.
+
+## Historical documentation
 
 > **Deployment retired / migration source only.** New externally reachable
 > Cloudflare Workers belong to `gftdcojp/net-kotobase`. Reusable runtime and
