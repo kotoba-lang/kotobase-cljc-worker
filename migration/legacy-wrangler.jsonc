@@ -1,0 +1,76 @@
+{
+  // RETIRED DEPLOY SURFACE. This manifest is retained only to reproduce and
+  // migrate the historical R2 runtime. Public Cloudflare deployment ownership
+  // belongs exclusively to gftdcojp/net-kotobase; do not add routes here.
+  //
+  // Serves kotobase.aozora.app (moved off the WASM worker 2026-07-02): the owner
+  // authorized discarding the old Rust-format data and adopting the CLJC
+  // prolly/chain format, so yoro-social starts fresh under the `kotobase/cljc`
+  // R2 prefix. Rollback = move this custom_domain route back to the WASM worker.
+  "name": "kotobase-cljc-worker",
+  "main": "out/worker.js",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "routes": [],
+  // Raised from the (unset) plan default so a one-time catch-up `fold` can
+  // synchronously decode/merge yoro-social-v2's mass-write novelty backlog
+  // (ADR-2607110200 addendum, 2026-07-10: reads AND folds were hitting
+  // Cloudflare error 1102, CPU time exceeded, well before any I/O-bound
+  // R2 concurrency limit) -- 300000ms is the documented max for the
+  // Workers Standard usage model; once the backlog is folded into a fresh
+  // cold snapshot, steady-state reads/folds go back to being cheap and
+  // this ceiling stops mattering in practice.
+  "limits": { "cpu_ms": 300000 },
+  "r2_buckets": [
+    { "binding": "BUCKET", "bucket_name": "kotobase-wasm-staging" }
+  ],
+  "vars": {
+    // v3 (2026-07-07, ADR-2607051000 "Deploy #2" cutover): the ciphertext-
+    // seam adoption (f9454dbf) changed the novelty-tx-block wire shape to
+    // {"ct": ...}, incompatible with v2's plaintext blocks (no back-compat
+    // reader) -- confirmed live, rolled back, then migrated via an offline
+    // snapshot!-based re-transact (kotobase-peer.core/snapshot!, the
+    // documented cold-start/migration entry point), NOT the CACAO-gated
+    // HTTP transact endpoint (that derives the write graph from the
+    // signer, so it can't target an existing DID's graph without that
+    // DID's real key). Parity-diffed byte-for-byte, 0 missing/extra, before
+    // cutover. v2 stays untouched in R2 as rollback.
+    //
+    // Two graphs migrated: the operator's LEGACY "yoro-social" db-name
+    // (2,743 datoms -- superseded 2026-07-03 per YORO_DB_NAME below, but its
+    // data was carried forward for completeness/rollback symmetry) and the
+    // REAL live "yoro-social-v2" (458 datoms -- what YORO_DB_NAME in
+    // app-aozora-appview/pds's wrangler.jsonc actually names, i.e. what the
+    // AppView/PDS read/write). The first cutover attempt targeted only the
+    // legacy name and momentarily served an EMPTY feed in production
+    // (getTimeline/getVideoFeed) until caught and corrected -- always derive
+    // the graph from the db-name a real consumer's wrangler.jsonc names,
+    // never assume "yoro-social" without the "-v2".
+    "KOTOBASE_B2_PREFIX": "kotobase/cljc-v3",
+    "KOTOBASE_AUDIENCE": "did:web:kotobase.aozora.app",
+    "KOTOBASE_SECURITY_MODE": "legacy-public",
+    "KOTOBASE_POLICY_ADMIN_DIDS": "",
+    "KOTOBASE_PROTECTED_READER_DIDS": "",
+    "KOTOBASE_GRAPH_READER_DIDS": "",
+    "KOTOBASE_MAINTAINER_DIDS": "",
+    "KOTOBASE_REVOKED_DIDS": "",
+    "KOTOBASE_REVOKED_CREDENTIAL_CIDS": "",
+    "KOTOBASE_AUTHORITY_ROOT_DIDS": "",
+    // Optional AUTHORITY_REGISTRY service binding supersedes the three CSV
+    // root/revocation vars with a versioned runtime snapshot. The binding is a
+    // deployment trust root and must implement `snapshot(tenant)`.
+    "KOTOBASE_TENANT_ID": "aozora-production",
+    // private/sealed mode requires KOTOBASE_WRAPPED_KEYRING_JSON plus either a
+    // KEY_UNWRAPPER KMS/service binding (`unwrap(envelope, tenant)`) or the
+    // fallback KOTOBASE_HPKE_PRIVATE_KEY_B64 secret. The plaintext shape is
+    // {"active":"2026-07","keys":{"2026-07":{"aead":"<b64-32>",
+    // "blind":"<b64-32>"}, ...old decrypt keys...}}. Raw keyrings are accepted
+    // only when KOTOBASE_ALLOW_UNWRAPPED_KEYRING=1 (offline migration/tests).
+    // S5 additionally requires KOTOBASE_AUDIT_SEED_B64 (base64 Ed25519 seed).
+    // empty = accept any validly-signed CACAO (staging); set the operator DID
+    // allowlist before the production cutover.
+    "KOTOBASE_OPERATOR_DIDS": ""
+  }
+}
+

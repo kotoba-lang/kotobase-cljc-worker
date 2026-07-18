@@ -12,3 +12,8 @@ Invariants:
   rollback ownership belong to `gftdcojp/net-kotobase`;
 - reusable crypto, capability and storage code belongs in focused
   `kotoba-lang` libraries, not in this historical adapter.
+
+The root `wrangler.jsonc` is an inert tombstone with no bindings. Historical
+R2 variables and bindings are isolated in `migration/legacy-wrangler.jsonc`;
+it is for offline reproduction and recovery exercises only, never normal CI or
+deployment.
