@@ -22,6 +22,7 @@
             [kotobase.cacao :as cacao]
             [kotobase.cid :as cid]
             [kotobase.ipns :as ipns]
+            [kotobase-peer.policy :as policy]
             ["@ipld/dag-cbor" :as dag-cbor]
             ["@noble/curves/ed25519.js" :refer [ed25519]]
             ["@noble/hashes/sha2.js" :refer [sha256]]))
@@ -195,6 +196,85 @@
          :nonce (.-nonce p)
          :request-id request-id}))
     (catch :default _ nil)))
+
+;; ── kg.* write CACAO verify (ai.gftd.apps.kotobase.kg.ingest[_batch]) ───────
+;; A SEPARATE, self-contained verifier from verify-cacao-context above --
+;; deliberately not a reuse OR a modification of it, so this brand-new kg
+;; dispatch path can never perturb the byte-identical behavior of the
+;; already-working datomic.transact/fold/read CACAO checks that fn backs
+;; (this repo's standing rule: additive-only next to the existing, working
+;; datomic.* handlers).
+
+(def ^:private kg-graph-resource-re #"^kotoba://graph/(.+)$")
+(def ^:private kg-transact-resources
+  "Both spellings of a transact-capability resource this fn accepts as
+  proof of a write grant. kotobase-peer.policy/transact-capability is the
+  literal string \"kotoba://can/datom:transact\", but the REAL, live kg
+  caller mints \"kotoba://op/datom:transact\" instead
+  (cloud_itonami/identity_core.cljc's kotobase-resources, following \"the
+  kotoba/kotobase convention (kotoba-lang/kagi, cacao README)\" per that
+  ns's own docstring) -- a genuine, pre-existing naming split between two
+  parts of this codebase family, not invented here. A CACAO still has to
+  carry ONE of them, cryptographically signed; accepting both widens which
+  literal string counts, it does not drop the requirement."
+  #{"kotoba://can/datom:transact" "kotoba://op/datom:transact"})
+
+(defn verify-kg-write-cacao
+  "Verify a kg.* WRITE CACAO carried ONLY via the `authorization: CACAO
+  <b64>` header (unlike datomic.transact, which reads :cacao_b64 from the
+  JSON body) -- kg.ingest/kg.ingest_batch's real, live caller
+  (cloud_itonami/net_kotobase.clj's kg-ingest!) sends `Authorization: CACAO
+  <cacao>` + `x-kotoba-did: <did>`, no cacao_b64 body field at all, so this
+  is a genuinely different wire shape from datomic.transact's, not a
+  refactor of it.
+
+  The graph a kg write targets is DERIVED from the CACAO's OWN
+  `kotoba://graph/<db-name>` resource, never client-body-supplied
+  (kg.ingest has no :graph/:db_name body field at all) -- exactly the
+  trust boundary a signed capability resource is FOR. `canonical-graph
+  (issuer, db-name)` mirrors datomic.transact's own did+db_name
+  derivation, so a kg write for a given (did, db_name) lands in the SAME
+  graph a datomic.transact write for that db_name would -- kg/claim/*,
+  kg/relation/*, kg/entity/* quads coexist with any ledger data in one
+  graph per tenant, no separate kg-graph bookkeeping needed.
+
+  Deliberately does NOT reuse verify-cacao-context's 10-minute max-CACAO-
+  age / 1-minute clock-skew windows -- the real live caller mints hour-
+  plus TTL session CACAOs (cloud_itonami.net-kotobase/crm-lead-ingest!'s
+  default is 1h), which those windows (sized for short browser-session
+  tokens) would reject outright. This fn's rigor instead matches `verify-
+  cacao`/`verify-cacao-full` above (both already-exported, already-used-
+  elsewhere, real-signature-checked, real-expiry-checked verifiers in this
+  same file) -- a genuinely less strict but still real level of
+  verification already established in this codebase, not invented for
+  this path.
+
+  → {:did :db-name :graph} on success, nil on ANY failure (bad signature,
+  wrong audience, expired, no transact-capability resource, no graph
+  resource, revoked issuer)."
+  [cacao-b64 {:keys [audience revoked-dids]}]
+  (when (and (string? cacao-b64) (seq cacao-b64))
+    (try
+      (let [^js env (.decode dag-cbor (cacao/base64->bytes cacao-b64))
+            ^js p   (.-p env)
+            iss (.-iss p)
+            pub (cid/did-key->ed25519-pub iss)
+            exp (.-exp p)
+            aud (.-aud p)
+            resources (set (vec (.-resources p)))
+            p-clj {:domain (.-domain p) :iss iss :aud aud :version (.-version p)
+                   :nonce (.-nonce p) :iat (.-iat p) :exp exp :statement (.-statement p)
+                   :resources (vec (.-resources p))}
+            msg (cacao/cacao-siwe-message p-clj)
+            sig (cacao/base64url->bytes (.. env -s -s))
+            db-name (some #(second (re-matches kg-graph-resource-re %)) resources)]
+        (when (and pub (= aud audience) (not (expired? exp))
+                   (not (contains? (set revoked-dids) iss))
+                   (seq db-name)
+                   (some kg-transact-resources resources)
+                   (.verify ed25519 sig (cid/text->bytes msg) pub))
+          {:did iss :db-name db-name :graph (cid/canonical-graph iss db-name)}))
+      (catch :default _ nil))))
 
 (defn- csv-set [env k]
   (let [v (some-> (gobj/get env k) str/trim)]
@@ -824,6 +904,61 @@
                           :effective-caps #{"kotoba://can/ipns:publish"}})))))
       (.then (fn [audited] (json-response audited (.-status response)))))))
 
+;; ── kg.* dispatch (ai.gftd.apps.kotobase.kg.ingest[_batch], additive) ───────
+;; A SEPARATE NSID family from datomic.* -- new cond branch in fetch-handler
+;; below, never touching the existing ns-prefix/ipns-ns-prefix branches.
+;; Auth is header-carried (verify-kg-write-cacao, above) rather than the
+;; body's :cacao_b64 datomic.transact reads, and the graph is derived from
+;; the verified CACAO's own capability resource rather than a body
+;; :db_name -- both real differences from datomic.transact's wire shape,
+;; not an oversight. Reuses run-write/flush-blocks-and-cas-head! unchanged
+;; (the same CAS-with-retry commit orchestration transact/fold already
+;; share) -- only the auth + graph-derivation front end is new.
+
+(def ^:private kg-ns-prefix (str "/xrpc/" h/kg-ns "."))
+(def ^:private kg-methods #{"ingest" "ingest_batch"})
+
+(defn- kg-status [resp]
+  (cond (:ok resp) 200
+        (= "AccessDenied" (:error resp)) 403
+        (= "MethodNotImplemented" (:error resp)) 404
+        (= "ConcurrentWriteConflict" (:error resp)) 409
+        :else 400))
+
+(defn kg-fetch-handler
+  "Handle one `/xrpc/ai.gftd.apps.kotobase.kg.<sub>` request. `sub` is
+  \"ingest\"/\"ingest_batch\" (kg-methods) -- an unrecognized sub still
+  returns handler.cljc's own MethodNotImplemented shape, not a bare edge
+  404, so a caller sees the SAME error contract as an unrecognized
+  datomic.* method."
+  [^js req ^js env sub]
+  (if-not (contains? kg-methods sub)
+    (js/Promise.resolve (json-response {:ok false :error "MethodNotImplemented"
+                                        :method (str "kg." sub)} 404))
+    (-> (ensure-keyring! env)
+        (.then (fn [_] (read-json-limited req)))
+        (.then (fn [raw]
+                 (let [body (js->clj raw :keywordize-keys true)
+                       authz (.get (.-headers req) "authorization")
+                       cacao-b64 (when (and (string? authz) (re-find #"(?i)^CACAO\s+" authz))
+                                   (str/replace authz #"(?i)^CACAO\s+" ""))]
+                   (if-let [{:keys [did graph]}
+                            (verify-kg-write-cacao
+                             cacao-b64
+                             {:audience (audience env)
+                              :revoked-dids (authority-set env :revoked-dids "KOTOBASE_REVOKED_DIDS")})]
+                     (-> (run-write (.-BUCKET env) (prefix env) (str "kg." sub)
+                                    (assoc body :graph graph)
+                                    {:did did :effective-caps #{policy/transact-capability}
+                                     :security-mode (security-mode env)}
+                                    (crypto-profile env graph))
+                         (.then (fn [resp] (json-response resp (kg-status resp)))))
+                     (js/Promise.resolve
+                      (json-response {:ok false :error "AuthRequired"
+                                      :message "kg write requires a valid Authorization: CACAO <b64> header carrying a transact-capability + graph resource"} 401))))))
+        (.catch (fn [^js e]
+                  (json-response {:ok false :error "InternalError" :message (.-message e)} 500))))))
+
 ;; ── dispatch ─────────────────────────────────────────────────────────────────
 
 (def ^:private ns-prefix (str "/xrpc/" h/datomic-ns "."))
@@ -876,6 +1011,9 @@
                      (.catch (fn [^js audit-error]
                                (json-response {:ok false :error "AuditUnavailable"
                                                :message (.-message audit-error)} 500)))))))))
+
+      (str/starts-with? path kg-ns-prefix)
+      (kg-fetch-handler req env (subs path (count kg-ns-prefix)))
 
       (not (str/starts-with? path ns-prefix))
       (js/Promise.resolve (json-response {:ok false :error "NotFound"} 404))
