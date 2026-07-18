@@ -5,6 +5,7 @@
   node-test runner is the only consumer of this file in practice."
   (:require #?(:clj  [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
+            [clojure.string :as str]
             [kotobase.cljc-worker.handler :as h]
             [kotobase-peer.core :as eng]))
 
@@ -562,5 +563,104 @@
                       (h/handle store "datoms" {:graph g} nil)))
              (.then (fn [r]
                       (is (empty? (filter #(= ":dm.message/text" (:a %)) (:datoms r))) "anon sees none")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+;; ── kg.ingest / kg.ingest_batch (ai.gftd.apps.kotobase.kg.*) ────────────────
+
+(deftest kg-entity->quads-projects-scalars-claims-and-relations
+  (is (= #{{:s "e1" :p "kg/entity/type" :o "plm.item"}
+           {:s "e1" :p "kg/entity/labelEn" :o "Widget"}
+           {:s "e1" :p "kg/claim/plm.item/part-no" :o "PN-1"}
+           {:s "e1" :p "kg/relation/plm.bom/child" :o "e2"}}
+         (set (h/kg-entity->quads
+               {:id "e1" :type "plm.item" :labelEn "Widget"
+                :claims [{:pred "plm.item/part-no" :value "PN-1"}]
+                :relations [{:pred "plm.bom/child" :dstId "e2"}]})))
+      "the REAL live caller's camelCase pred/value/dstId shape (cloud-itonami)"))
+
+(deftest kg-entity->quads-accepts-the-lexicons-snake-case-shape-too
+  (is (= #{{:s "e1" :p "kg/entity/labelEn" :o "Widget"}
+           {:s "e1" :p "kg/claim/plm.item/part-no" :o "PN-1"}
+           {:s "e1" :p "kg/relation/plm.bom/child" :o "e2"}}
+         (set (h/kg-entity->quads
+               {:id "e1" :label_en "Widget"
+                :claims [{:predicate "plm.item/part-no" :object "PN-1"}]
+                :relations [{:predicate "plm.bom/child" :target "e2"}]})))
+      "ai.gftd.apps.kotobase.kg.ingest's own documented predicate/object/target shape"))
+
+(deftest kg-entity->quads-emits-kg-label-vec-under-either-key
+  (is (= [{:s "e1" :p "kg/label_vec" :o "[0.1 0.2]"}]
+         (h/kg-entity->quads {:id "e1" :labelVec [0.1 0.2]})))
+  (is (= [{:s "e1" :p "kg/label_vec" :o "[0.1 0.2]"}]
+         (h/kg-entity->quads {:id "e1" :label_vec [0.1 0.2]}))))
+
+(deftest kg-entity->quads-requires-an-id
+  (is (thrown? #?(:clj Exception :cljs :default)
+               (h/kg-entity->quads {:type "plm.item"}))))
+
+(deftest kg-subject-cid-is-deterministic-content-addressed-and-real
+  (let [entity {:id "e1" :type "x"}]
+    (is (= (h/kg-subject-cid entity) (h/kg-subject-cid entity))
+        "same entity -> same CID (deterministic)")
+    (is (not= (h/kg-subject-cid entity) (h/kg-subject-cid (assoc entity :type "y")))
+        "different content -> different CID (content-addressed, not a fabricated string)")
+    (is (str/starts-with? (h/kg-subject-cid entity) "b")
+        "CIDv1 base32-lower multibase, ipld.core's own convention")))
+
+#?(:cljs
+   (deftest kg-ingest-commits-quads-and-returns-a-real-content-cid
+     (async done
+       (let [store (mem-store)
+             entity {:id "crm.lead:1" :type "crm.lead" :labelEn "selftest"
+                     :claims [{:pred "crm.lead/source" :value "kg-ingest-test"}]
+                     :relations []}]
+         (-> (h/handle store "kg.ingest" (assoc entity :graph g) "did:web:x")
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (string? (:subjectCid r)))
+                      (is (str/starts-with? (:subjectCid r) "b")
+                          "subjectCid is a real CIDv1 base32 content hash, not a fabricated string")
+                      (is (= 3 (:quadCount r)) "2 entity-scalar quads (type, labelEn) + 1 claim quad")
+                      (is (some? (:commit r)))
+                      (h/handle store "datoms" {:graph g} nil)))
+             (.then (fn [r]
+                      (let [rows (set (map #(select-keys % [:e :a :v_edn]) (:datoms r)))]
+                        (is (contains? rows {:e "crm.lead:1" :a "kg/entity/labelEn" :v_edn "\"selftest\""}))
+                        (is (contains? rows {:e "crm.lead:1" :a "kg/claim/crm.lead/source" :v_edn "\"kg-ingest-test\""})))
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest kg-ingest-batch-commits-every-entity-in-one-chain-advance
+     (async done
+       (let [store (mem-store)
+             entities [{:id "e1" :type "plm.item" :claims [{:pred "p" :value "v1"}] :relations []}
+                       {:id "e2" :type "plm.item" :claims [{:pred "p" :value "v2"}] :relations []}]]
+         (-> (h/handle store "kg.ingest_batch" {:graph g :entities entities} "did:web:x")
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= 2 (:ingested r)))
+                      (is (= 2 (count (:subjectCids r))))
+                      (is (= 4 (:quadCount r)) "2 entities x (1 type quad + 1 claim quad)")
+                      (h/do-datoms store {:graph g})))
+             (.then (fn [r]
+                      (is (= 4 (count (:datoms r))))
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest kg-ingest-is-exactly-as-write-gated-as-a-datom-write
+     ;; A verified viewer lacking the transact capability must be denied --
+     ;; kg.ingest reuses policy/assert-write-authorized! verbatim (kg-commit!),
+     ;; the SAME gate datomic.transact itself cannot bypass.
+     (async done
+       (let [store (mem-store)
+             no-transact-cap {:did "did:web:reader" :effective-caps #{}}]
+         (-> (h/handle store "kg.ingest" {:graph g :id "e1" :type "x"} no-transact-cap)
+             (.then (fn [r]
+                      (is (not (:ok r)))
+                      (is (= "AccessDenied" (:error r)))
+                      (is (nil? ((:head-get store) g)) "denied write never advances the graph head")
                       (done)))
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
