@@ -44,6 +44,9 @@ jobs:
           key: ${{ runner.os }}-cljs-${{ hashFiles('package.json', 'deps.edn') }}
 
       - run: npm install
+      - run: npm install --global nbb
+      - name: lint hot-datoms calls (async-get-fn guardrail, kotoba-lang/kotobase-peer#21)
+        run: nbb bin/lint_hot_datoms_calls.cljs
       - run: npm test
 
   lint:
