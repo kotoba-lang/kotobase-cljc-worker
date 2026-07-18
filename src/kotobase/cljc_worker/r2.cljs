@@ -100,7 +100,9 @@
   "Conditional head write. `etag` non-nil: succeeds only if the key's CURRENT
   etag still equals `etag` (R2's onlyIf.etagMatches — a native
   compare-and-swap against a KNOWN-EXISTING object, no read-modify-write
-  gap). `etag` nil: the caller's r2-get-head found no object, i.e. first
+  gap). `etag` nil: create-if-absent via `etagDoesNotMatch` is used. (The
+  historical paragraph below describes the former unconditional behavior
+  and is retained only as incident context.) The caller found no object, i.e. first
   write to a new graph — R2's onlyIf has no documented \"only if absent\"
   condition (etagMatches against a nonexistent object is a comparison with
   nothing, not a green light; an earlier version of this fn wrongly assumed
@@ -117,6 +119,7 @@
   retry)."
   [^js bucket k chain etag]
   (if (nil? etag)
-    (-> (.put bucket k chain) (.then (fn [_] true)))
+    (-> (.put bucket k chain #js {:onlyIf #js {:etagDoesNotMatch "*"}})
+        (.then (fn [result] (boolean result))))
     (-> (.put bucket k chain #js {:onlyIf #js {:etagMatches etag}})
         (.then (fn [result] (boolean result))))))

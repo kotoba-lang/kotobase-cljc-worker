@@ -294,6 +294,95 @@
              (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
 
 #?(:cljs
+   (deftest rotation-transaction-is-guarded-by-ledger-head-and-dag-slot
+     (async done
+       (let [store (mem-store)
+             base {:graph g
+                   :expected_ledger_seq -1
+                   :expected_ledger_hash nil
+                   :rotation_id "r1"
+                   :rotation_subject "did:key:owner"
+                   :rotation_purpose ":authority"
+                   :rotation_from_epoch 0
+                   :tx_edn (pr-str [{:db/id "kagi:rotation:r1"
+                                     :rotation/id "r1"
+                                     :rotation/subject "did:key:owner"
+                                     :rotation/purpose :authority
+                                    :rotation/from-epoch 0}
+                                    {:db/id "kagi:ledger:0"
+                                     :ledger/seq 0 :ledger/prev-hash nil
+                                     :ledger/hash "h0"}])}]
+         (-> (h/handle store "transactRotation" base "did:web:x")
+             (.then (fn [first-write]
+                      (is (:ok first-write))
+                      ;; Exact replay is recognized without publishing a
+                      ;; second ledger entry.
+                      (h/handle store "transactRotation" base "did:web:x")))
+             (.then (fn [replay]
+                      (is (false? (:ok replay)))
+                      (is (= "RotationAlreadyCommitted" (:error replay)))
+                      ;; A caller rebuilt on the current ledger head, but tries
+                      ;; to occupy the already-used subject/purpose/epoch slot.
+                      (h/handle store "transactRotation"
+                                (assoc base
+                                       :expected_ledger_seq 0
+                                       :expected_ledger_hash "h0"
+                                       :rotation_id "r2"
+                                       :tx_edn (pr-str [{:db/id "kagi:rotation:r2"
+                                                         :rotation/id "r2"
+                                                         :rotation/subject "did:key:owner"
+                                                         :rotation/purpose :authority
+                                                         :rotation/from-epoch 0}
+                                                        {:db/id "kagi:ledger:1"
+                                                         :ledger/seq 1
+                                                         :ledger/prev-hash "h0"
+                                                         :ledger/hash "h1"}]))
+                                "did:web:x")))
+             (.then (fn [fork]
+                      (is (false? (:ok fork)))
+                      (is (= "CompetingRotationChild" (:error fork)))
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest ordinary-transact-cannot-bypass-kagi-rotation-admission
+     (async done
+       (let [store (mem-store)]
+         (-> (h/handle store "transact"
+                       {:graph g
+                        :tx_edn (pr-str [{:db/id "evil"
+                                          :rotation/id "bypass"
+                                          :ledger/seq 0}])}
+                       "did:web:x")
+             (.then (fn [resp]
+                      (is (false? (:ok resp)))
+                      (is (= "GuardedKagiAttribute" (:error resp)))
+                      (is (nil? ((:head-get store) g))
+                          "rejected bypass never creates a graph head")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest ledger-append-has-server-side-head-and-payload-guards
+     (async done
+       (let [store (mem-store)
+             first-body {:graph g :expected_ledger_seq -1
+                         :expected_ledger_hash nil
+                         :tx_edn (pr-str [{:db/id "kagi:ledger:0"
+                                           :ledger/seq 0 :ledger/prev-hash nil
+                                           :ledger/hash "h0"}])}]
+         (-> (h/handle store "transactLedger" first-body "did:web:x")
+             (.then (fn [ok]
+                      (is (:ok ok))
+                      ;; Replaying a stale previous-head claim must not append.
+                      (h/handle store "transactLedger" first-body "did:web:x")))
+             (.then (fn [stale]
+                      (is (false? (:ok stale)))
+                      (is (= "LedgerPreconditionFailed" (:error stale)))
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
    (deftest retraction-roundtrip-through-the-handler
      ;; ADR-2607071610 Phase 1 e2e at the worker layer: a [:db/retractEntity]
      ;; in tx_edn cancels the entity across novelty reads AND across a fold,

@@ -18,7 +18,7 @@
 
 ;; Same fidelity contract as r2-test's make-fake-bucket (this repo's own
 ;; precedent for mocking R2 without a live Cloudflare binding): async
-;; .get/.put, minted etags, unconditional put on a nil onlyIf.
+;; .get/.put, minted etags, including create-if-absent conditional puts.
 ;;
 ;; Optional `store` arg (default: a fresh atom) lets a caller keep a
 ;; reference to the underlying key/value map to inspect after a call --
@@ -35,9 +35,13 @@
                          :etag etag})))
           :put (fn [k v ^js opts]
                  (js/Promise.resolve
-                  (let [required (some-> opts .-onlyIf .-etagMatches)]
-                    (if (and (some? required)
-                             (not= required (:etag (get @store k))))
+                  (let [required (some-> opts .-onlyIf .-etagMatches)
+                        excluded (some-> opts .-onlyIf .-etagDoesNotMatch)
+                        current (:etag (get @store k))]
+                    (if (or (and (some? required) (not= required current))
+                            (and (= "*" excluded) (some? current))
+                            (and (some? excluded) (not= "*" excluded)
+                                 (= excluded current)))
                       nil
                       (let [new-etag (str "etag-" (swap! etag-seq inc))]
                         (swap! store assoc k {:value v :etag new-etag})
@@ -68,6 +72,53 @@
                      (is (:ok resp) (str "resp: " (pr-str resp)))
                      (is (:folded resp)))
                    (done)))
+          (.catch (fn [e] (is false (str "unexpected rejection: " (.-message e))) (done)))))))
+
+(defn- rotation-body [graph rid to-key ledger-hash]
+  {:graph graph
+   :expected_ledger_seq -1
+   :expected_ledger_hash nil
+   :rotation_id rid
+   :rotation_subject "did:key:owner"
+   :rotation_purpose ":authority"
+   :rotation_from_epoch 0
+   :tx_edn (pr-str [{:db/id (str "kagi:rotation:" rid)
+                      :rotation/id rid
+                      :rotation/subject "did:key:owner"
+                      :rotation/purpose :authority
+                      :rotation/from-key "old"
+                      :rotation/to-key to-key
+                      :rotation/from-epoch 0}
+                     {:db/id "kagi:ledger:0"
+                      :ledger/seq 0 :ledger/prev-hash nil
+                      :ledger/hash ledger-hash}])})
+
+(deftest concurrent-competing-rotations-publish-exactly-one-head
+  (async done
+    (let [bucket (make-fake-bucket)
+          graph "rotation-race"]
+      ;; Establish a real-etag graph head without a ledger, then launch both
+      ;; rotations before either Promise has completed its conditional PUT.
+      (-> (w/run-write bucket "" "transact"
+                       {:graph graph :tx_edn "[{:db/id \"seed\" :app/kind :seed}]"} nil)
+          (.then (fn [_]
+                   (js/Promise.all
+                    #js [(w/run-write bucket "" "transactRotation"
+                                      (rotation-body graph "r-a" "new-a" "h-a") nil)
+                         (w/run-write bucket "" "transactRotation"
+                                      (rotation-body graph "r-b" "new-b" "h-b") nil)])))
+          (.then (fn [results]
+                   (let [rs (js->clj results :keywordize-keys true)
+                         accepted (filter :ok rs)
+                         rejected (remove :ok rs)]
+                     (is (= 1 (count accepted))
+                         "R2 head CAS allows exactly one competing child")
+                     (is (= 1 (count rejected)))
+                     (is (contains? #{"RotationPreconditionFailed"
+                                      "CompetingRotationChild"}
+                                    (:error (first rejected)))
+                         "the CAS loser revalidates against the winner's fresh snapshot")
+                     (done))))
           (.catch (fn [e] (is false (str "unexpected rejection: " (.-message e))) (done)))))))
 
 (deftest fold-against-a-real-async-bucket-populates-the-memoized-hydration-cache

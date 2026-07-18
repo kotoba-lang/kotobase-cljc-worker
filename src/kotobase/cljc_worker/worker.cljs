@@ -38,10 +38,10 @@
          (or (not (js/Number.isFinite parsed))
              (< parsed (.getTime (js/Date.)))))))
 
-(defn verify-cacao
-  "→ issuer DID (string) | nil. Decodes the CACAO, recomputes its SIWE message,
-  and Ed25519-verifies under the issuer's did:key. Same source the PDS mints/
-  verifies with (kotobase.cacao), so client and worker can't drift."
+(defn verify-cacao-claims
+  "→ verified {:issuer :resources} | nil. Capability resources are returned
+  from the same signed SIWE payload; callers must authorize the requested
+  operation rather than treating any valid CACAO as a universal write token."
   [cacao-b64]
   (try
     (let [^js env (.decode dag-cbor (cacao/base64->bytes cacao-b64))
@@ -56,8 +56,77 @@
           msg (cacao/cacao-siwe-message p-clj)
           sig (cacao/base64url->bytes (.. env -s -s))]
       (when (and pub (not expired?) (.verify ed25519 sig (cid/text->bytes msg) pub))
-        iss))
+        {:issuer iss :aud (:aud p-clj) :nonce (:nonce p-clj)
+         :iat (:iat p-clj) :exp (:exp p-clj)
+         :resources (:resources p-clj)}))
     (catch :default _ nil)))
+
+(defn verify-cacao [cacao-b64]
+  (:issuer (verify-cacao-claims cacao-b64)))
+
+(defn- has-capability? [claims capability]
+  (contains? (set (:resources claims)) (str "kotoba://can/" capability)))
+
+(defn valid-cacao-nonce? [nonce]
+  (and (string? nonce) (<= 12 (count nonce) 128)
+       (boolean (re-matches #"[A-Za-z0-9_-]+" nonce))))
+
+(defn valid-cacao-audience? [^js env claims]
+  (let [expected (some-> (gobj/get env "KOTOBASE_CACAO_AUDIENCE") str/trim)]
+    ;; A write edge without an explicit audience is a dangerous deployment,
+    ;; not a wildcard multi-tenant mode: fail closed.
+    (boolean (and (seq expected) (= expected (:aud claims))))))
+
+(defn valid-cacao-window?
+  "Mutation tokens must carry an explicit, short validity window. Legacy
+  no-exp CACAO may still be signature-decoded, but cannot authorize writes."
+  ([claims] (valid-cacao-window? claims (.getTime (js/Date.)) 600000))
+  ([{:keys [iat exp]} now-ms max-ttl-ms]
+   (let [issued (when iat (js/Date.parse iat))
+         expires (when exp (js/Date.parse exp))]
+     (boolean
+      (and (number? issued) (js/Number.isFinite issued)
+           (number? expires) (js/Number.isFinite expires)
+           ;; tolerate one minute of clock skew, but reject replay of an old
+           ;; still-unexpired token minted far in the past.
+           (<= (- now-ms 60000) issued (+ now-ms 60000))
+           (> expires now-ms)
+           (<= (- expires issued) max-ttl-ms))))))
+
+(defn consume-cacao-nonce!
+  "Atomically consume one verified request nonce. R2 is strongly consistent;
+  If-None-Match:* makes concurrent replays race safely with exactly one winner."
+  [^js bucket pfx {:keys [issuer nonce]}]
+  (let [key (str pfx "cacao-nonce/v1/" (js/encodeURIComponent issuer) "/" nonce)]
+    (-> (.put bucket key "used" #js {:onlyIf #js {:etagDoesNotMatch "*"}})
+        (.then (fn [result] (boolean result))))))
+
+(defn cleanup-expired-cacao-nonces!
+  "Delete only replay markers older than 24h. Since write CACAO lifetime is
+  capped at 10m, this preserves replay resistance with a large safety margin
+  while bounding attacker-controlled marker growth."
+  ([bucket pfx] (cleanup-expired-cacao-nonces! bucket pfx (.getTime (js/Date.))))
+  ([^js bucket pfx now-ms]
+   (let [nonce-prefix (str pfx "cacao-nonce/v1/")
+         cutoff (- now-ms 86400000)]
+     (letfn [(page [cursor deleted]
+               (let [opts #js {:prefix nonce-prefix :limit 1000}]
+                 (when cursor (gobj/set opts "cursor" cursor))
+                 (-> (.list bucket opts)
+                   (.then
+                    (fn [^js result]
+                      (let [expired (->> (array-seq (.-objects result))
+                                         (filter #(< (.getTime (.-uploaded ^js %)) cutoff))
+                                         (mapv #(.-key ^js %)))
+                            delete-p (if (seq expired)
+                                       (.delete bucket (clj->js expired))
+                                       (js/Promise.resolve nil))]
+                        (-> delete-p
+                            (.then (fn [_]
+                                     (if (.-truncated result)
+                                       (page (.-cursor result) (+ deleted (count expired)))
+                                       (+ deleted (count expired))))))))))))]
+       (page nil 0)))))
 
 (defn- authorized?
   "A transact is authorized iff a CACAO VERIFIED (issuer non-nil) and — when a
@@ -350,28 +419,52 @@
                      (let [body (js->clj raw :keywordize-keys true)]
                        (case method
                          ("datoms" "q" "pull" "diagHydrateCost" "diagCommitCost") (run-read (.-BUCKET env) (prefix env) method body)
-                         "transact"
+                         ("transact" "transactRotation" "transactLedger")
                          ;; kotobase transact sends :db_name (+ cacao), NOT :graph —
                          ;; the graph is DERIVED as canonical-graph(issuer, db_name)
                          ;; so a write always lands on the issuer's own graph.
-                         (let [issuer (some-> (:cacao_b64 body) verify-cacao)]
-                           (if-not (authorized? env issuer)
+                         (let [claims (some-> (:cacao_b64 body) verify-cacao-claims)
+                               issuer (:issuer claims)
+                               required (case method
+                                          "transactRotation" ["datom:transact" "kagi:rotate"]
+                                          "transactLedger" ["datom:transact" "kagi:ledger"]
+                                          ["datom:transact"])]
+                           (if-not (and (authorized? env issuer)
+                                        (valid-cacao-audience? env claims)
+                                        (valid-cacao-nonce? (:nonce claims))
+                                        (valid-cacao-window? claims)
+                                        (every? #(has-capability? claims %) required))
                              (js/Promise.resolve (json-response {:ok false :error "AuthRequired"} 403))
                              (let [graph (cid/canonical-graph issuer (:db_name body))]
-                               (run-write (.-BUCKET env) (prefix env) "transact"
-                                          (assoc body :graph graph) issuer))))
+                               (-> (consume-cacao-nonce! (.-BUCKET env) (prefix env) claims)
+                                   (.then (fn [fresh?]
+                                            (if fresh?
+                                              (run-write (.-BUCKET env) (prefix env) method
+                                                         (assoc body :graph graph) issuer)
+                                              (json-response {:ok false :error "CacaoReplay"} 409))))))))
                          "fold"
                          ;; Maintenance op (ADR-2607032430 D1): an authorized caller
                          ;; (cron/ops, not necessarily the graph owner — one operator
                          ;; identity may fold many actors' graphs) names the :graph
                          ;; directly, unlike transact's derived graph.
-                         (let [issuer (some-> (:cacao_b64 body) verify-cacao)]
-                           (if-not (authorized? env issuer)
+                         (let [claims (some-> (:cacao_b64 body) verify-cacao-claims)
+                               issuer (:issuer claims)]
+                           (if-not (and (authorized? env issuer)
+                                        (valid-cacao-audience? env claims)
+                                        (valid-cacao-nonce? (:nonce claims))
+                                        (valid-cacao-window? claims))
                              (js/Promise.resolve (json-response {:ok false :error "AuthRequired"} 403))
-                             (run-write (.-BUCKET env) (prefix env) "fold" body issuer)))
+                             (-> (consume-cacao-nonce! (.-BUCKET env) (prefix env) claims)
+                                 (.then (fn [fresh?]
+                                          (if fresh?
+                                            (run-write (.-BUCKET env) (prefix env) "fold" body issuer)
+                                            (json-response {:ok false :error "CacaoReplay"} 409)))))))
                          (js/Promise.resolve {:ok false :error "MethodNotImplemented" :method method})))))
             (.then (fn [resp] (if (instance? js/Response resp) resp (json-response resp 200))))
             (.catch (fn [^js e]
                       (json-response {:ok false :error "InternalError" :message (.-message e)} 500))))))))
 
-(def handler #js {:fetch fetch-handler})
+(defn scheduled-handler [_controller ^js env ^js ctx]
+  (.waitUntil ctx (cleanup-expired-cacao-nonces! (.-BUCKET env) (prefix env))))
+
+(def handler #js {:fetch fetch-handler :scheduled scheduled-handler})

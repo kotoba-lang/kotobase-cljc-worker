@@ -76,9 +76,13 @@
                    #js {:text (fn [] (js/Promise.resolve value)) :etag etag})))
          :put (fn [k v ^js opts]
                 (js/Promise.resolve
-                 (let [required (some-> opts .-onlyIf .-etagMatches)]
-                   (if (and (some? required)
-                            (not= required (:etag (get @store k))))
+                 (let [required (some-> opts .-onlyIf .-etagMatches)
+                       excluded (some-> opts .-onlyIf .-etagDoesNotMatch)
+                       current (:etag (get @store k))]
+                   (if (or (and (some? required) (not= required current))
+                           (and (= "*" excluded) (some? current))
+                           (and (some? excluded) (not= "*" excluded)
+                                (= excluded current)))
                      nil        ; onlyIf.etagMatches present AND mismatched -> reject
                      (let [new-etag (str "etag-" (swap! etag-seq inc))]
                        (swap! store assoc k {:value v :etag new-etag})
@@ -100,22 +104,19 @@
                    (is (some? etag))
                    (done)))))))
 
-(deftest r2-put-head-if-match-nil-etag-is-unconditional
-  ;; The documented, accepted narrow race: a nil etag (no prior read, or the
-  ;; key was absent) writes unconditionally — this is the ONLY path where two
-  ;; writers can race undetected, and only for the very first commit of a
-  ;; graph, never for accumulated history (every subsequent write goes
-  ;; through the real-etag CAS path below).
+(deftest r2-put-head-if-match-nil-etag-is-create-if-absent
+  ;; etagDoesNotMatch "*" gives If-None-Match:* semantics: a stale nil
+  ;; snapshot cannot overwrite the genesis winner.
   (async done
     (let [bucket (make-fake-bucket)]
       (-> (r2/r2-put-head-if-match bucket "heads/g1" "chainA" nil)
           (.then (fn [ok?] (is ok? "first write succeeds")))
           (.then (fn [_] (r2/r2-put-head-if-match bucket "heads/g1" "chainB" nil)))
           (.then (fn [ok?]
-                   (is ok? "a nil-etag put is unconditional — it overwrites, it does not reject")
+                   (is (false? ok?) "a second genesis writer loses the create-if-absent CAS")
                    (r2/r2-get-head bucket "heads/g1")))
           (.then (fn [{:keys [chain]}]
-                   (is (= "chainB" chain) "the second (unconditional) writer wins, as expected")
+                   (is (= "chainA" chain) "the genesis winner is never overwritten")
                    (done)))))))
 
 (deftest r2-put-head-if-match-rejects-on-stale-etag

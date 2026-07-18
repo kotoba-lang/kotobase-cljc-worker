@@ -15,6 +15,7 @@
   "routes": [
     { "pattern": "kotobase.aozora.app", "custom_domain": true }
   ],
+  "triggers": { "crons": ["17 * * * *"] },
   // Raised from the (unset) plan default so a one-time catch-up `fold` can
   // synchronously decode/merge yoro-social-v2's mass-write novelty backlog
   // (ADR-2607110200 addendum, 2026-07-10: reads AND folds were hitting
@@ -50,6 +51,7 @@
     // the graph from the db-name a real consumer's wrangler.jsonc names,
     // never assume "yoro-social" without the "-v2".
     "KOTOBASE_B2_PREFIX": "kotobase/cljc-v3",
+    "KOTOBASE_CACAO_AUDIENCE": "did:web:kotobase.aozora.app",
     // empty = accept any validly-signed CACAO (staging); set the operator DID
     // allowlist before the production cutover.
     "KOTOBASE_OPERATOR_DIDS": ""

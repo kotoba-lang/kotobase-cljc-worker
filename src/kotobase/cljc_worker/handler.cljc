@@ -127,6 +127,20 @@
                            (constantly true) crypto/blind-fn crypto/decrypt-fn)
            (fn [rows] {:ok true :graph graph :datoms (vec rows)}))))
 
+(defn- commit-quads [store graph quads]
+  (let [get-fn (:get-fn store)
+        prev-chain ((:head-get store) graph)]
+    (then* (eng/commit! (:put! store) get-fn quads prev-chain crypto/encrypt-fn)
+           (fn [chain]
+             ((:head-put! store) graph chain)
+             {:ok true :graph graph :commit chain
+              :datom_count (count quads)
+              :novelty_size (eng/novelty-size get-fn chain)}))))
+
+(defn- kagi-guarded-quad? [{:keys [p]}]
+  (or (str/starts-with? (or p "") ":rotation/")
+      (str/starts-with? (or p "") ":ledger/")))
+
 (defn do-transact
   "`datomic.transact` — append the tx quads as ONE novelty block and advance
   the chain. O(|tx_edn|) — independent of graph size; never hydrates or
@@ -137,15 +151,140 @@
   response is an observability signal for when a `fold` (see `do-fold`) is
   worth invoking — this handler never folds itself."
   [store {:keys [graph tx_edn]} _auth-did]
-  (let [get-fn (:get-fn store)
-        prev-chain ((:head-get store) graph)
-        quads (tx-edn->quads tx_edn)]
-    (then* (eng/commit! (:put! store) get-fn quads prev-chain crypto/encrypt-fn)
-           (fn [chain]
-             ((:head-put! store) graph chain)
-             {:ok true :graph graph :commit chain
-              :datom_count (count quads)
-              :novelty_size (eng/novelty-size get-fn chain)}))))
+  (let [quads (vec (tx-edn->quads tx_edn))]
+    (if (some kagi-guarded-quad? quads)
+      {:ok false :error "GuardedKagiAttribute"
+       :message "rotation and ledger attributes require transactRotation"}
+      (commit-quads store graph quads))))
+
+(defn- singleton-value [db entity attr]
+  (let [values (get (qs/entity-attrs db entity) attr #{})]
+    (when (= 1 (count values)) (first values))))
+
+(defn- parse-long-safe [x]
+  (try
+    #?(:clj (Long/parseLong (str x))
+       :cljs (let [n (js/Number (str x))]
+               (when (and (js/Number.isSafeInteger n) (>= n 0)) n)))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
+
+(defn- ledger-head [db]
+  (let [entries (keep (fn [e]
+                        (when-let [seq (parse-long-safe
+                                        (singleton-value db e ":ledger/seq"))]
+                          {:entity e :seq seq
+                           :hash (singleton-value db e ":ledger/hash")}))
+                      (keys (qs/by-predicate db ":ledger/seq")))]
+    (when (seq entries) (apply max-key :seq entries))))
+
+(defn- ledger-precondition-error [db expected-seq expected-hash]
+  (let [head (ledger-head db)
+        actual-seq (if head (:seq head) -1)
+        actual-hash (when head (:hash head))]
+    (cond
+      (not= expected-seq actual-seq)
+      {:error "LedgerPreconditionFailed" :condition "ledger-seq"
+       :expected expected-seq :actual actual-seq}
+      (not= expected-hash actual-hash)
+      {:error "LedgerPreconditionFailed" :condition "ledger-hash"
+       :expected expected-hash :actual actual-hash}
+      :else nil)))
+
+(defn- quad-values [quads attr]
+  (mapv :o (filter #(= attr (:p %)) quads)))
+
+(defn- ledger-payload-error [quads expected-seq expected-hash]
+  (let [seqs (quad-values quads ":ledger/seq")
+        prevs (quad-values quads ":ledger/prev-hash")]
+    (cond
+      (not= [(str (inc expected-seq))] seqs)
+      {:error "InvalidLedgerPayload" :condition "next-seq"}
+      (if (nil? expected-hash)
+        (not (or (empty? prevs) (= [""] prevs)))
+        (not= [(str expected-hash)] prevs))
+      {:error "InvalidLedgerPayload" :condition "prev-hash"}
+      (not= 1 (count (quad-values quads ":ledger/hash")))
+      {:error "InvalidLedgerPayload" :condition "single-hash"}
+      :else nil)))
+
+(defn- rotation-payload-error
+  [quads {:keys [rotation_id rotation_subject rotation_purpose rotation_from_epoch
+                 expected_ledger_seq expected_ledger_hash]}]
+  (or (ledger-payload-error quads expected_ledger_seq expected_ledger_hash)
+      (when-not (= [(str rotation_id)] (quad-values quads ":rotation/id"))
+        {:error "InvalidRotationPayload" :condition "rotation-id"})
+      (when-not (= [(str rotation_subject)] (quad-values quads ":rotation/subject"))
+        {:error "InvalidRotationPayload" :condition "rotation-subject"})
+      (when-not (= [(str rotation_purpose)] (quad-values quads ":rotation/purpose"))
+        {:error "InvalidRotationPayload" :condition "rotation-purpose"})
+      (when-not (= [(str rotation_from_epoch)] (quad-values quads ":rotation/from-epoch"))
+        {:error "InvalidRotationPayload" :condition "rotation-from-epoch"})))
+
+(defn- rotation-precondition-error
+  "Validate the optimistic rotation guard against the exact graph snapshot
+  used by this write attempt.  This is deliberately server-side: a client-side
+  read followed by ordinary `transact` has a TOCTOU window."
+  [db {:keys [expected_ledger_seq expected_ledger_hash rotation_id
+              rotation_subject rotation_purpose rotation_from_epoch]}]
+  (let [ledger-error (ledger-precondition-error db expected_ledger_seq expected_ledger_hash)
+        duplicate? (seq (qs/by-predicate-value db ":rotation/id" (str rotation_id)))
+        children (for [e (keys (qs/by-predicate db ":rotation/subject"))
+                       :when (and (= (str rotation_subject)
+                                     (singleton-value db e ":rotation/subject"))
+                                  (= (str rotation_purpose)
+                                     (singleton-value db e ":rotation/purpose"))
+                                  (= (str rotation_from_epoch)
+                                     (singleton-value db e ":rotation/from-epoch")))]
+                   e)]
+    (cond
+      duplicate?
+      {:error "RotationAlreadyCommitted" :rotation_id rotation_id}
+      ledger-error (assoc ledger-error :error "RotationPreconditionFailed")
+      (seq children)
+      {:error "CompetingRotationChild" :rotation_id rotation_id}
+      :else nil)))
+
+(defn do-transact-rotation
+  "Atomically admit a Kagi rotation into the same content-addressed novelty
+  block as its item/grant/ledger records. Preconditions are checked against
+  this attempt's head snapshot; the workerd shell subsequently advances that
+  head with R2 ETag CAS. A lost CAS reruns this entire function on a fresh
+  snapshot, so stale ledger heads and competing children fail closed."
+  [store {:keys [graph tx_edn] :as body} _auth-did]
+  (let [chain ((:head-get store) graph)
+        quads (vec (tx-edn->quads tx_edn))
+        validate-and-commit
+        (fn [db]
+          (if-let [failure (or (rotation-payload-error quads body)
+                               (rotation-precondition-error db body))]
+            (assoc failure :ok false :graph graph)
+            (commit-quads store graph quads)))]
+    (if chain
+      (then* (eng/hydrate-chain (:get-fn store) chain
+                                (or (:blind-fn store) crypto/blind-fn)
+                                (or (:decrypt-fn store) crypto/decrypt-fn))
+             validate-and-commit)
+      (validate-and-commit (qs/empty-db)))))
+
+(defn do-transact-ledger
+  "Append a non-rotation audit entry only if its claimed previous ledger head
+  is still current. The outer storage shell CASes the graph head and retries
+  this whole check, closing both the client TOCTOU and storage-head races."
+  [store {:keys [graph tx_edn expected_ledger_seq expected_ledger_hash]} _auth-did]
+  (let [chain ((:head-get store) graph)
+        quads (vec (tx-edn->quads tx_edn))
+        commit-if-valid
+        (fn [db]
+          (if-let [failure (or (ledger-payload-error quads expected_ledger_seq
+                                                     expected_ledger_hash)
+                               (ledger-precondition-error db expected_ledger_seq
+                                                          expected_ledger_hash))]
+            (assoc failure :ok false :graph graph)
+            (commit-quads store graph quads)))]
+    (if chain
+      (then* (eng/hydrate-chain (:get-fn store) chain crypto/blind-fn crypto/decrypt-fn)
+             commit-if-valid)
+      (commit-if-valid (qs/empty-db)))))
 
 (defn- hot-db
   "The full hot db as of `chain` (snapshot + novelty merged) — for `do-q`,
@@ -371,6 +510,8 @@
       (let [resp (case method
                    "datoms"   (do-datoms store body)
                    "transact" (do-transact store body auth-did)
+                   "transactRotation" (do-transact-rotation store body auth-did)
+                   "transactLedger" (do-transact-ledger store body auth-did)
                    "q"        (do-q store body)
                    "pull"     (do-pull store body)
                    "fold"     (do-fold store body)
