@@ -1,7 +1,16 @@
 {:paths ["src"]
- :deps {}
+ :deps {io.github.kotoba-lang/kotobase-server
+        {:git/url "https://github.com/kotoba-lang/kotobase-server.git"
+         :git/sha "c960c4ef8ae507c2c7369acde7a6b2ccb2543c73"}}
  :aliases
- {;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
+ {:cljs {:extra-paths ["test"
+                        "../kotobase-peer/src" "../datom/src"
+                        "../arrangement/src" "../prolly-tree/src"
+                        "../chain/src" "../io-ipld/src"
+                        "../io-multiformats/src" "../org-ietf-cbor/src"
+                        "../kotobase-client/src"]
+         :extra-deps {thheller/shadow-cljs {:mvn/version "2.28.20"}}}
+  ;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
   :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
          :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"
                      "--fail-level" "error"]}}}

@@ -1,7 +1,7 @@
 {
-  // CLJC kotobase datom-plane worker — filter-honoring replacement for the WASM
-  // worker (ADR-2607022330 addendum 2). Build: `npx shadow-cljs release worker`
-  // → out/worker.js (:esm, default export {fetch}).
+  // RETIRED DEPLOY SURFACE. This manifest is retained only to reproduce and
+  // migrate the historical R2 runtime. Public Cloudflare deployment ownership
+  // belongs exclusively to gftdcojp/net-kotobase; do not add routes here.
   //
   // Serves kotobase.aozora.app (moved off the WASM worker 2026-07-02): the owner
   // authorized discarding the old Rust-format data and adopting the CLJC
@@ -11,10 +11,8 @@
   "main": "out/worker.js",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
-  "workers_dev": true,
-  "routes": [
-    { "pattern": "kotobase.aozora.app", "custom_domain": true }
-  ],
+  "workers_dev": false,
+  "routes": [],
   // Raised from the (unset) plan default so a one-time catch-up `fold` can
   // synchronously decode/merge yoro-social-v2's mass-write novelty backlog
   // (ADR-2607110200 addendum, 2026-07-10: reads AND folds were hitting
@@ -50,6 +48,26 @@
     // the graph from the db-name a real consumer's wrangler.jsonc names,
     // never assume "yoro-social" without the "-v2".
     "KOTOBASE_B2_PREFIX": "kotobase/cljc-v3",
+    "KOTOBASE_AUDIENCE": "did:web:kotobase.aozora.app",
+    "KOTOBASE_SECURITY_MODE": "legacy-public",
+    "KOTOBASE_POLICY_ADMIN_DIDS": "",
+    "KOTOBASE_PROTECTED_READER_DIDS": "",
+    "KOTOBASE_GRAPH_READER_DIDS": "",
+    "KOTOBASE_MAINTAINER_DIDS": "",
+    "KOTOBASE_REVOKED_DIDS": "",
+    "KOTOBASE_REVOKED_CREDENTIAL_CIDS": "",
+    "KOTOBASE_AUTHORITY_ROOT_DIDS": "",
+    // Optional AUTHORITY_REGISTRY service binding supersedes the three CSV
+    // root/revocation vars with a versioned runtime snapshot. The binding is a
+    // deployment trust root and must implement `snapshot(tenant)`.
+    "KOTOBASE_TENANT_ID": "aozora-production",
+    // private/sealed mode requires KOTOBASE_WRAPPED_KEYRING_JSON plus either a
+    // KEY_UNWRAPPER KMS/service binding (`unwrap(envelope, tenant)`) or the
+    // fallback KOTOBASE_HPKE_PRIVATE_KEY_B64 secret. The plaintext shape is
+    // {"active":"2026-07","keys":{"2026-07":{"aead":"<b64-32>",
+    // "blind":"<b64-32>"}, ...old decrypt keys...}}. Raw keyrings are accepted
+    // only when KOTOBASE_ALLOW_UNWRAPPED_KEYRING=1 (offline migration/tests).
+    // S5 additionally requires KOTOBASE_AUDIT_SEED_B64 (base64 Ed25519 seed).
     // empty = accept any validly-signed CACAO (staging); set the operator DID
     // allowlist before the production cutover.
     "KOTOBASE_OPERATOR_DIDS": ""
