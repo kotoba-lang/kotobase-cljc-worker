@@ -1,7 +1,0 @@
-{
-  "name": "kotobase-cljc-worker-retired",
-  "main": "out/worker.js",
-  "compatibility_date": "2026-06-01",
-  "workers_dev": false,
-  "routes": []
-}
