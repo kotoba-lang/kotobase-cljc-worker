@@ -102,7 +102,7 @@ shadow-cljs source-paths (`../<dep>/src`).
 ```bash
 npm install
 npm test                       # handler + trampoline (node)
-npx shadow-cljs release worker # → out/worker.js (:esm)
+amu compile --target wasm32-browser worker # → out/worker.js (:esm)
 ```
 
 Private/sealed promotion additionally requires the six-part operational
